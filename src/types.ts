@@ -37,7 +37,7 @@ export interface TimingInfo {
   startTime: number;
   endTime: number;
   totalDurationMs: number;
-  exitReason: 'early_exit_quick_pattern' | 'early_exit_periodic_check' | 'process_exit' | 'timeout';
+  exitReason: 'process_started' | 'early_exit_quick_pattern' | 'early_exit_periodic_check' | 'process_exit' | 'timeout';
   firstOutputTime?: number;
   lastOutputTime?: number;
   timeToFirstOutputMs?: number;
