@@ -7,6 +7,7 @@ cd /d "%~dp0"
 set "REPO_DIR=%CD%"
 set "LOCAL_INDEX=%REPO_DIR%\dist\index.js"
 set "GLOBAL_INDEX=%APPDATA%\npm\node_modules\@wonderwhy-er\desktop-commander\dist\index.js"
+set "PUPPETEER_SKIP_DOWNLOAD=true"
 
 echo ============================================================
 echo Remote Desktop Commander - Local Fork
@@ -48,15 +49,17 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/3] Building local fork...
+echo [2/3] Preparing local fork...
 if not exist "%REPO_DIR%\node_modules" (
     echo node_modules not found - running npm install...
+    echo Puppeteer browser download is disabled for this local coding build.
     call npm install
     if errorlevel 1 goto :fail
+) else (
+    echo Building current source...
+    call npm run build
+    if errorlevel 1 goto :fail
 )
-
-call npm run build
-if errorlevel 1 goto :fail
 
 if not exist "%LOCAL_INDEX%" (
     echo [ERROR] Build completed but dist\index.js was not found:
