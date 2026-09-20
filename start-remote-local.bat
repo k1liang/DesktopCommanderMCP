@@ -50,16 +50,17 @@ if errorlevel 1 (
 
 echo.
 echo [2/3] Preparing local fork...
-if not exist "%REPO_DIR%\node_modules" (
-    echo node_modules not found - running npm install...
+if not exist "%REPO_DIR%\node_modules\.bin\tsc.cmd" (
+    echo Local development dependencies are missing or incomplete.
+    echo Running npm install --include=dev...
     echo Puppeteer browser download is disabled for this local coding build.
-    call npm install
-    if errorlevel 1 goto :fail
-) else (
-    echo Building current source...
-    call npm run build
+    call npm install --include=dev
     if errorlevel 1 goto :fail
 )
+
+echo Building current source...
+call npm run build
+if errorlevel 1 goto :fail
 
 if not exist "%LOCAL_INDEX%" (
     echo [ERROR] Build completed but dist\index.js was not found:
