@@ -497,7 +497,7 @@ export class TerminalManager {
       session.isBlocked = true;
       exitReason = 'process_started';
       resolveOnce({
-        pid: childProcess.pid,
+        pid: childProcess.pid!,
         output: '',
         isBlocked: true
       });
