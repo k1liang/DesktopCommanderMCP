@@ -349,6 +349,7 @@ export class TerminalManager {
       // land on the next tick) is replayed rather than dropped.
       if (pendingProcessError) {
         forwardProcessError(pendingProcessError);
+        return;
       }
 
       childProcess.stdout.on('data', (data: any) => {
@@ -470,6 +471,18 @@ export class TerminalManager {
           output,
           isBlocked: false
         });
+      });
+
+      // start_process is a spawn operation, not a wait-for-output operation.
+      // Once the process and its listeners are registered, return the PID
+      // immediately. Output remains buffered in the session and is consumed
+      // through read_process_output / interact_with_process.
+      session.isBlocked = true;
+      exitReason = 'process_started';
+      resolveOnce({
+        pid: childProcess.pid,
+        output: '',
+        isBlocked: true
       });
     });
   }
