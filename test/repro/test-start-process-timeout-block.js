@@ -2,126 +2,96 @@ import assert from 'assert';
 import { terminalManager } from '../../dist/terminal-manager.js';
 
 /**
- * Repro / characterization test for issue #310:
- *   "start_process blocks ... causing Claude Desktop crashes"
- *
- * Root cause (src/terminal-manager.ts executeCommand): the call resolves early
- * ONLY via one of:
- *   - a quick prompt pattern (>>> > $ #) on a stdout chunk
- *   - analyzeProcessState() detecting a REPL prompt (guarded by output)
- *   - process exit
- *   - the timeoutMs fallback
- *
- * A long-running process that produces no prompt-like output and does not exit
- * hits none of the early paths, so executeCommand is held for the FULL
- * timeoutMs. With a large timeout_ms this is the multi-minute pending tool call
- * users observe.
- *
- * NOTE: this is an async wait, not a literal event-loop block. The issue's
- * "blocks Electron main thread" framing is inaccurate, but the user-visible
- * symptom (tool call pending for the whole timeout) is real and is what this
- * test reproduces. If a cap-the-initial-wait fix lands, Tests 1 & 2 should be
- * updated to assert the capped duration instead.
+ * Regression coverage for the local start_process policy:
+ * executeCommand() is a spawn operation. Once the child process and listeners
+ * are registered it must return the PID immediately; output and completion are
+ * consumed later through read_process_output / the TerminalManager buffer.
  */
 
-const TIMEOUT_MS = 800;        // short, keeps the test fast
-const PROC_LIFETIME_MS = 6000; // child lives well past the timeout
+const START_MAX_MS = 500;
+const PROC_LIFETIME_MS = 2000;
 
-const since = (t) => Date.now() - t;
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const cleanup = (pid) => { try { terminalManager.forceTerminate(pid); } catch {} };
 
-/**
- * Test 1 (core repro): a SILENT long-running process produces no output, so
- * neither the quick-pattern nor the periodic analyzeProcessState path can fire
- * (the periodic check is guarded by `output.trim()`). The only thing that ends
- * the call is the timeout fallback => the call is held for the full timeoutMs.
- */
-async function testSilentProcessWaitsFullTimeout() {
-  console.log('\n📋 Test 1: silent long-running process is held for the full timeout...');
+async function testSilentProcessReturnsImmediately() {
+  console.log('\n📋 Test 1: silent long-running process returns immediately...');
   const t0 = Date.now();
   const res = await terminalManager.executeCommand(
     `node -e "setTimeout(function(){}, ${PROC_LIFETIME_MS})"`,
-    TIMEOUT_MS,
+    10000,
     undefined,
-    true // collectTiming -> populates timingInfo.exitReason
+    true
   );
-  const elapsed = since(t0);
-  cleanup(res.pid);
+  const elapsed = Date.now() - t0;
 
-  assert(res.pid > 0, 'should have spawned a process');
-  assert.strictEqual(res.isBlocked, true, 'should report isBlocked=true');
-  assert.strictEqual(res.output.trim(), '', 'silent process should produce no output');
-  assert.strictEqual(res.timingInfo.exitReason, 'timeout',
-    `expected exitReason "timeout", got "${res.timingInfo.exitReason}"`);
-  assert(elapsed >= TIMEOUT_MS - 75,
-    `should wait ~the full timeout (>=${TIMEOUT_MS}ms), only waited ${elapsed}ms`);
-  assert(elapsed < PROC_LIFETIME_MS - 500,
-    `should return via timeout, not process exit (elapsed ${elapsed}ms)`);
-  console.log(`  ✅ held for ${elapsed}ms via timeout (timeout=${TIMEOUT_MS}ms, proc=${PROC_LIFETIME_MS}ms)`);
+  try {
+    assert(res.pid > 0, 'should have spawned a process');
+    assert.strictEqual(res.isBlocked, true, 'running process should report isBlocked=true');
+    assert.strictEqual(res.output, '', 'start_process should not wait for initial output');
+    assert.strictEqual(res.timingInfo?.exitReason, 'process_started');
+    assert(elapsed < START_MAX_MS, `start_process should return in <${START_MAX_MS}ms, took ${elapsed}ms`);
+    assert(terminalManager.getSession(res.pid), 'session must remain registered after start_process returns');
+    console.log(`  ✅ returned in ${elapsed}ms with PID ${res.pid}`);
+  } finally {
+    cleanup(res.pid);
+  }
 }
 
-/**
- * Test 2 (reporter's scenario): a CHATTY but prompt-less long-running process
- * (the "Python test script that didn't output prompt-like patterns"). It emits
- * plain progress lines that match no REPL prompt and no completion pattern, so
- * it is also held for the full timeout despite producing output.
- */
-async function testChattyNonPromptProcessWaitsFullTimeout() {
-  console.log('\n📋 Test 2: chatty (no-prompt) long-running process is held for the full timeout...');
+async function testOutputRemainsReadableAfterImmediateReturn() {
+  console.log('\n📋 Test 2: output remains readable after immediate return...');
   const t0 = Date.now();
   const res = await terminalManager.executeCommand(
     `node -e "setInterval(function(){console.log('progress')},100);setTimeout(function(){},${PROC_LIFETIME_MS})"`,
-    TIMEOUT_MS,
+    10000,
     undefined,
     true
   );
-  const elapsed = since(t0);
-  cleanup(res.pid);
+  const elapsed = Date.now() - t0;
 
-  assert.strictEqual(res.isBlocked, true, 'should report isBlocked=true');
-  assert(res.output.includes('progress'), 'should have captured progress output');
-  assert.strictEqual(res.timingInfo.exitReason, 'timeout',
-    `non-prompt output must not trigger early exit; got "${res.timingInfo.exitReason}"`);
-  assert(elapsed >= TIMEOUT_MS - 75,
-    `should wait ~the full timeout (>=${TIMEOUT_MS}ms), only waited ${elapsed}ms`);
-  assert(elapsed < PROC_LIFETIME_MS - 500,
-    `should return via timeout, not process exit (elapsed ${elapsed}ms)`);
-  console.log(`  ✅ held for ${elapsed}ms despite output (exitReason=${res.timingInfo.exitReason})`);
+  try {
+    assert(elapsed < START_MAX_MS, `start_process should return in <${START_MAX_MS}ms, took ${elapsed}ms`);
+    await sleep(350);
+
+    const output = terminalManager.readOutputPaginated(res.pid, 0, 100);
+    assert(output, 'running session output should be readable');
+    assert(output.lines.join('\n').includes('progress'), 'buffer should contain process output');
+    assert.strictEqual(output.isComplete, false, 'process should still be running');
+    console.log(`  ✅ returned in ${elapsed}ms and buffered output remained readable`);
+  } finally {
+    cleanup(res.pid);
+  }
 }
 
-/**
- * Test 3 (contrast / regression guard): when the process DOES emit a recognized
- * prompt, executeCommand returns promptly via the quick-pattern path, well
- * before the (large) timeout. This proves the bug is specific to prompt-less
- * processes and guards the early-exit path from regressing.
- */
-async function testPromptProcessReturnsEarly() {
-  console.log('\n📋 Test 3: prompt-emitting process returns early (not at timeout)...');
-  const bigTimeout = 5000;
+async function testCompletedProcessRemainsReadable() {
+  console.log('\n📋 Test 3: completed process output remains readable...');
   const t0 = Date.now();
   const res = await terminalManager.executeCommand(
-    `node -e "process.stdout.write('>>> ');setTimeout(function(){},${PROC_LIFETIME_MS})"`,
-    bigTimeout,
+    `node -e "setTimeout(function(){console.log('done')},150)"`,
+    10000,
     undefined,
     true
   );
-  const elapsed = since(t0);
-  cleanup(res.pid);
+  const elapsed = Date.now() - t0;
 
-  assert.strictEqual(res.isBlocked, true, 'prompt means blocked/waiting for input');
-  assert(elapsed < 1000, `should return quickly via prompt, took ${elapsed}ms`);
-  assert(res.timingInfo.exitReason.startsWith('early_exit'),
-    `expected an early_exit reason, got "${res.timingInfo.exitReason}"`);
-  console.log(`  ✅ returned early after ${elapsed}ms (exitReason=${res.timingInfo.exitReason})`);
+  assert(elapsed < START_MAX_MS, `start_process should return in <${START_MAX_MS}ms, took ${elapsed}ms`);
+  await sleep(500);
+
+  const output = terminalManager.readOutputPaginated(res.pid, 0, 100);
+  assert(output, 'completed session should remain readable');
+  assert.strictEqual(output.isComplete, true, 'process should have completed');
+  assert.strictEqual(output.exitCode, 0, 'process should exit successfully');
+  assert(output.lines.join('\n').includes('done'), 'completed output should contain done');
+  console.log(`  ✅ returned in ${elapsed}ms; completion and output were retained`);
 }
 
 async function runAllTests() {
-  console.log('🚀 Starting #310 start_process timeout-block tests...');
+  console.log('🚀 Starting immediate start_process regression tests...');
   try {
-    await testSilentProcessWaitsFullTimeout();
-    await testChattyNonPromptProcessWaitsFullTimeout();
-    await testPromptProcessReturnsEarly();
-    console.log('\n🎉 All #310 timeout-block tests passed!');
+    await testSilentProcessReturnsImmediately();
+    await testOutputRemainsReadableAfterImmediateReturn();
+    await testCompletedProcessRemainsReadable();
+    console.log('\n🎉 All immediate start_process tests passed!');
     return true;
   } catch (error) {
     console.error('\n❌ Test failed:', error.message);
