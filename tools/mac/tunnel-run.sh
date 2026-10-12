@@ -11,7 +11,13 @@ TUNNEL_RUN_BIN="${TUNNEL_CLIENT_RUN_BIN:-${TUNNEL_CLIENT_BIN:-}}"
 [[ -n "$TUNNEL_RUN_BIN" ]] || { echo "[ERROR] Set TUNNEL_CLIENT_BIN or TUNNEL_CLIENT_RUN_BIN in tunnel.local.sh" >&2; exit 1; }
 [[ "$CONTROL_PLANE_API_KEY" != "PASTE_YOUR_RUNTIME_API_KEY_HERE" && "$CONTROL_PLANE_TUNNEL_ID" != "PASTE_YOUR_TUNNEL_ID_HERE" ]] || { echo "[ERROR] Replace credential placeholders in tunnel.local.sh" >&2; exit 1; }
 [[ -f "$TUNNEL_RUN_BIN" ]] || { echo "[ERROR] Tunnel executable not found: $TUNNEL_RUN_BIN" >&2; exit 1; }
+
+echo "[INFO] Fix tunnel-client permission..."
 chmod +x "$TUNNEL_RUN_BIN"
+
+echo "[INFO] Remove macOS quarantine flag..."
+xattr -d com.apple.quarantine "$TUNNEL_RUN_BIN" 2>/dev/null || true
+
 export CONTROL_PLANE_API_KEY CONTROL_PLANE_TUNNEL_ID
 TUNNEL_PROFILE="${TUNNEL_PROFILE:-desktop-commander}"
 echo "[INFO] Starting tunnel profile $TUNNEL_PROFILE ..."

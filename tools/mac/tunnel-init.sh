@@ -12,7 +12,13 @@ source "$CONFIG"
 [[ "$CONTROL_PLANE_API_KEY" != "PASTE_YOUR_RUNTIME_API_KEY_HERE" && "$CONTROL_PLANE_TUNNEL_ID" != "PASTE_YOUR_TUNNEL_ID_HERE" ]] || { echo "[ERROR] Replace credential placeholders in tunnel.local.sh" >&2; exit 1; }
 TUNNEL_PROFILE="${TUNNEL_PROFILE:-desktop-commander}"
 [[ -f "$TUNNEL_CLIENT_BIN" ]] || { echo "[ERROR] Full tunnel-client executable not found: $TUNNEL_CLIENT_BIN" >&2; exit 1; }
+
+echo "[INFO] Fix tunnel-client permission..."
 chmod +x "$TUNNEL_CLIENT_BIN"
+
+echo "[INFO] Remove macOS quarantine flag..."
+xattr -d com.apple.quarantine "$TUNNEL_CLIENT_BIN" 2>/dev/null || true
+
 # Gatekeeper: after verifying the download, optionally remove quarantine by running:
 # TUNNEL_TRUST_DOWNLOADED_BINARY=1 ./tunnel-init.sh
 if [[ "${TUNNEL_TRUST_DOWNLOADED_BINARY:-0}" == "1" ]]; then
