@@ -1,3 +1,7 @@
+// Shared defaults across macOS, Windows, and Linux. Both remain user-configurable.
+export const DEFAULT_FILE_READ_LINE_LIMIT = 5000;
+export const DEFAULT_FILE_WRITE_LINE_LIMIT = 2000;
+
 export type ConfigFieldValueType = 'string' | 'number' | 'boolean' | 'array' | 'null';
 
 export type ConfigFieldDefinition = {
@@ -30,12 +34,12 @@ export const CONFIG_FIELD_DEFINITIONS = {
   },
   fileReadLineLimit: {
     label: 'File Read Limit',
-    description: 'Maximum number of lines returned from a file in one read action. Lower numbers keep responses short and safer; higher numbers return more text at once.',
+    description: 'Default number of lines returned in one read_file action when length is omitted. Larger results take more time and model context; callers can request specific ranges.',
     valueType: 'number',
   },
   fileWriteLineLimit: {
     label: 'File Write Limit',
-    description: 'Maximum number of lines that can be written in one edit operation. This helps prevent accidental oversized writes and keeps file changes predictable.',
+    description: 'Warning threshold for the number of lines in a write or edit. This is not a hard limit: larger edits still succeed. Large payloads may be slower to transfer.',
     valueType: 'number',
   },
 } as const satisfies Record<string, ConfigFieldDefinition>;

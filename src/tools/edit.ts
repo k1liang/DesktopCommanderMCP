@@ -25,6 +25,7 @@ import { EditBlockArgsSchema } from "./schemas.js";
 import path from 'path';
 import { detectLineEnding, normalizeLineEndings } from '../utils/lineEndingHandler.js';
 import { configManager } from '../config-manager.js';
+import { DEFAULT_FILE_WRITE_LINE_LIMIT } from '../config-field-definitions.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
 import { resolveAbsolutePath } from '../handlers/filesystem-handlers.js';
@@ -153,7 +154,7 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
     
     // Get the line limit from configuration
     const config = await configManager.getConfig();
-    const MAX_LINES = config.fileWriteLineLimit ?? 50; // Default to 50 if not set
+    const MAX_LINES = config.fileWriteLineLimit ?? DEFAULT_FILE_WRITE_LINE_LIMIT; // Fallback warning threshold
     
     // Detect file's line ending style
     const fileLineEnding = detectLineEnding(content);
@@ -198,9 +199,7 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
         
         if (maxLines > MAX_LINES) {
             const problemText = searchLines > replaceLines ? 'search text' : 'replacement text';
-            warningMessage = `\n\nWARNING: The ${problemText} has ${maxLines} lines (maximum: ${MAX_LINES}).
-            
-RECOMMENDATION: For large search/replace operations, consider breaking them into smaller chunks with fewer lines.`;
+            warningMessage = `\n\nNOTE: The ${problemText} has ${maxLines} lines (warning threshold: ${MAX_LINES}); the edit completed. Large payloads may take longer to transfer.`;
         }
         
         await writeFile(filePath, newContent);

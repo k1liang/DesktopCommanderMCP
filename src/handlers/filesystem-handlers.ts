@@ -18,6 +18,7 @@ import { ServerResult } from '../types.js';
 import { withTimeout } from '../utils/withTimeout.js';
 import { createErrorResponse } from '../error-handlers.js';
 import { configManager } from '../config-manager.js';
+import { DEFAULT_FILE_READ_LINE_LIMIT, DEFAULT_FILE_WRITE_LINE_LIMIT } from '../config-field-definitions.js';
 
 import {
     ReadFileArgsSchema,
@@ -94,7 +95,7 @@ export async function handleReadFile(args: unknown): Promise<ServerResult> {
         // The schema fills in `length: 1000` (the default tools/list shows), so
         // whether the caller sent a length is read from the raw arguments: an
         // omitted length follows the fileReadLineLimit setting, as documented.
-        const defaultLimit = config.fileReadLineLimit ?? 1000;
+        const defaultLimit = config.fileReadLineLimit ?? DEFAULT_FILE_READ_LINE_LIMIT;
         const lengthGiven = (args as { length?: unknown }).length !== undefined;
 
         // The sheet goes as given: the Excel handler knows the sheet names, so it
@@ -341,15 +342,13 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
 
         // Get the line limit from configuration
         const config = await configManager.getConfig();
-        const MAX_LINES = config.fileWriteLineLimit ?? 50; // Default to 50 if not set
+        const MAX_LINES = config.fileWriteLineLimit ?? DEFAULT_FILE_WRITE_LINE_LIMIT; // Fallback warning threshold
 
         // Lines as read_file counts them: a final line break doesn't start another line
         const lineCount = TextFileHandler.countLines(parsed.content);
         let errorMessage = "";
         if (lineCount > MAX_LINES) {
-            errorMessage = `✅ File written successfully! (${lineCount} lines)
-            
-💡 Performance tip: For optimal speed, consider chunking files into ≤30 line pieces in future operations.`;
+            errorMessage = `\nNote: Write exceeded the ${MAX_LINES}-line warning threshold; the complete write succeeded.`;
         }
 
         // Pass the mode parameter to writeFile

@@ -6,6 +6,7 @@ import os from 'os';
 import lockfile from 'proper-lockfile';
 import { VERSION } from './version.js';
 import { CONFIG_FILE } from './config.js';
+import { DEFAULT_FILE_READ_LINE_LIMIT, DEFAULT_FILE_WRITE_LINE_LIMIT } from './config-field-definitions.js';
 import { getDefaultShell } from './utils/shell.js';
 import { writeFileAtomic } from './utils/atomic-write.js';
 import { backupCorruptConfig, buildRecoveredConfig, type RecoveryEvent, type RecoveryPhase } from './config-recovery.js';
@@ -38,8 +39,8 @@ export interface ServerConfig {
   defaultShell?: string;
   allowedDirectories?: string[];
   telemetryEnabled?: boolean; // New field for telemetry control
-  fileWriteLineLimit?: number; // Line limit for file write operations
-  fileReadLineLimit?: number; // Default line limit for file read operations (changed from character-based)
+  fileWriteLineLimit?: number; // Warning threshold for file write/edit operations
+  fileReadLineLimit?: number; // Default line limit for file read operations
   clientId?: string; // Unique client identifier for analytics
   currentClient?: ClientInfo; // Current connected client information
   [key: string]: any; // Allow for arbitrary configuration keys (including abTest_* keys)
@@ -278,8 +279,8 @@ class ConfigManager {
       defaultShell: getDefaultShell(),
       allowedDirectories: [],
       telemetryEnabled: true, // Default to opt-out approach (telemetry on by default)
-      fileWriteLineLimit: 50,  // Default line limit for file write operations (changed from 100)
-      fileReadLineLimit: 1000,  // Default line limit for file read operations (changed from character-based)
+      fileWriteLineLimit: DEFAULT_FILE_WRITE_LINE_LIMIT,  // Warning threshold, not a hard cap
+      fileReadLineLimit: DEFAULT_FILE_READ_LINE_LIMIT,  // Default read result size
       pendingWelcomeOnboarding: true, // New install flag - triggers A/B test for welcome page
       welcomeOnboardingEligible: true // Distinguishes new installs from migrated legacy configs
     };

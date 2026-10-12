@@ -8,6 +8,7 @@ import { configManager } from '../config-manager.js';
 import { getDefaultShell } from '../utils/shell.js';
 import { terminateProcessTree } from '../utils/process-tree.js';
 import { MAX_PROCESS_WAIT_MS } from '../config.js';
+import { DEFAULT_FILE_READ_LINE_LIMIT } from '../config-field-definitions.js';
 import { spawn } from 'child_process';
 import fs from 'fs/promises';
 import path from 'path';
@@ -321,7 +322,7 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
 
   // Get default line limit from config
   const config = await configManager.getConfig();
-  const defaultLength = config.fileReadLineLimit ?? 1000;
+  const defaultLength = config.fileReadLineLimit ?? DEFAULT_FILE_READ_LINE_LIMIT;
 
   const { 
     pid, 
@@ -481,7 +482,7 @@ export async function interactWithProcess(args: unknown, maxWaitMs: number = MAX
 
   // Get config for output line limit
   const config = await configManager.getConfig();
-  const maxOutputLines = config.fileReadLineLimit ?? 1000;
+  const maxOutputLines = config.fileReadLineLimit ?? DEFAULT_FILE_READ_LINE_LIMIT;
   const waitLimit = getProcessWaitLimit(timeout_ms, maxWaitMs);
 
   // Check if this is a virtual Node session (node:local)

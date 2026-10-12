@@ -78,11 +78,11 @@ import { addToolCallPaths, capture, capture_call_tool, runInUiOriginCallContext,
 import { logToStderr, logger } from './utils/logger.js';
 import {
     buildUiToolMeta,
-    CONFIG_EDITOR_RESOURCE_URI,
     FILE_PREVIEW_RESOURCE_URI,
 } from './ui/contracts.js';
 import { listUiResources, readUiResource } from './ui/resources.js';
 import { shouldShowMcpUiPreviews } from './utils/mcp-ui-ab-test.js';
+import { DEFAULT_FILE_READ_LINE_LIMIT, DEFAULT_FILE_WRITE_LINE_LIMIT } from './config-field-definitions.js';
 
 // Store startup messages to send after initialization
 const deferredMessages: Array<{ level: string, message: string }> = [];
@@ -318,8 +318,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - blockedCommands (array of blocked shell commands)
                         - defaultShell (shell to use for commands)
                         - allowedDirectories (paths the server can access)
-                        - fileReadLineLimit (max lines for read_file, default 1000)
-                        - fileWriteLineLimit (max lines per write_file call, default 50)
+                        - fileReadLineLimit (default read_file lines: ${DEFAULT_FILE_READ_LINE_LIMIT})
+                        - fileWriteLineLimit (write/edit warning threshold: ${DEFAULT_FILE_WRITE_LINE_LIMIT}; not a hard cap)
                         - telemetryEnabled (boolean for telemetry opt-in/out)
                         - currentClient (information about the currently connected MCP client)
                         - clientHistory (history of all clients that have connected)
@@ -327,7 +327,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - systemInfo (operating system and environment details)
                         ${CMD_PREFIX_DESCRIPTION}`,
                 inputSchema: zodToJsonSchema(GetConfigArgsSchema),
-                _meta: buildUiToolMeta(CONFIG_EDITOR_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "Get Configuration",
                     readOnlyHint: true,
@@ -347,8 +346,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - blockedCommands (array)
                         - defaultShell (string)
                         - allowedDirectories (array of paths)
-                        - fileReadLineLimit (number, max lines for read_file)
-                        - fileWriteLineLimit (number, max lines per write_file call)
+                        - fileReadLineLimit (number, default lines when read_file length is omitted)
+                        - fileWriteLineLimit (number, write/edit warning threshold; not a hard cap)
                         - telemetryEnabled (boolean)
                         
                         IMPORTANT: Setting allowedDirectories to an empty array ([]) allows full access 
@@ -377,7 +376,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - 'offset' (start line, default: 0)
                           * Positive: Start from line N (0-based indexing)
                           * Negative: Read last N lines from end (tail behavior)
-                        - 'length' (max lines to read, default: configurable via 'fileReadLineLimit' setting, initially 1000)
+                        - 'length' (max lines to read, default: configurable via 'fileReadLineLimit' setting, initially ${DEFAULT_FILE_READ_LINE_LIMIT})
                           * Used with positive offsets for range reading
                           * Ignored when offset is negative (reads all requested tail lines)
                         
@@ -460,17 +459,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         PDF creation is handled by the dedicated write_pdf tool.
                         Existing DOCX content can be edited with edit_block. New DOCX files can be created here; markdown headings (#, ##, ###) are converted to styled DOCX paragraphs.
 
-                        CHUNKED WRITES:
-                        - Repeated calls with mode='rewrite' followed by mode='append' are supported for longer files.
-                        - Chunks of roughly 25-30 lines minimize latency when writing long text, multiple files, documentation, code, or configuration files.
-                        - Files over 50 lines are still written successfully but may generate performance notes.
-                        - For continuation after a partial write, the existing file state can be inspected before appending the remaining content.
+                        For ordinary text files, prefer one write_file call rather than dozens
+                        of 25-30 line append calls. The configured fileWriteLineLimit is a
+                        warning threshold, not a hard cap. Only split genuinely large payloads
+                        when required by transport or context limits.
+
+                        For changes to existing code, prefer edit_block with a unique match or
+                        run a local patch script instead of rewriting the entire file.
+                        Always specify mode='rewrite' or mode='append' when modifying an
+                        existing file. On continuation, inspect the file and only write the
+                        remaining content to avoid accidental duplication.
 
                         FORMAT HANDLING (by extension):
                         - Text files: String content
                         - Excel (.xlsx, .xls, .xlsm): JSON 2D array or {"SheetName": [[...]]}
                           Example: '[["Name","Age"],["Alice",30]]'
 
+                        Writes above the configured fileWriteLineLimit generate a warning, but are still written successfully.
                         Only works within allowed directories.
 
                         ${PATH_GUIDANCE}
@@ -855,9 +860,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         When a close but non-exact match is found, a character-level diff is shown in the format:
                         common_prefix{-removed-}{+added+}common_suffix to help you identify what's different.
 
-                        Similar to write_file, there is a configurable line limit (fileWriteLineLimit) that warns
-                        if the edited file exceeds this limit. If this happens, consider breaking your edits into
-                        smaller, more focused changes.
+                        Similar to write_file, fileWriteLineLimit is a warning threshold,
+                        not a hard cap. Prefer a single precise edit for a unique match.
 
                         ${PATH_GUIDANCE}
                         ${CMD_PREFIX_DESCRIPTION}`,
@@ -941,7 +945,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - offset: -50, length: 10    → Start 50 from end, read 10 lines
                         
                         OUTPUT PROTECTION:
-                        - Uses same fileReadLineLimit as read_file (default: 1000 lines)
+                        - Uses same fileReadLineLimit as read_file (default: ${DEFAULT_FILE_READ_LINE_LIMIT} lines)
                         - Returns status like: [Reading 100 lines from line 0 (total: 5000 lines, 4900 remaining)]
                         - Prevents context overflow from verbose processes
                         
