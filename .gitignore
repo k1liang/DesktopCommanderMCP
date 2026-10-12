@@ -58,3 +58,10 @@ test_files/
 test_fix.js
 test_search.js
 .ripgrep-downloads/
+
+# Local Visual Studio cache
+.vs/
+
+# Private Tunnel credentials, tunnel ID and executable paths
+/tools/windows/tunnel.local.cmd
+/tools/mac/tunnel.local.sh

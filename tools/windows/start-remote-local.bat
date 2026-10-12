@@ -3,7 +3,7 @@ setlocal EnableExtensions
 chcp 65001 >nul
 title Remote Desktop Commander - Local Fork
 
-cd /d "%~dp0"
+cd /d "%~dp0..\.." || exit /b 1
 set "REPO_DIR=%CD%"
 set "LOCAL_INDEX=%REPO_DIR%\dist\index.js"
 set "GLOBAL_INDEX=%APPDATA%\npm\node_modules\@wonderwhy-er\desktop-commander\dist\index.js"

@@ -1,0 +1,7 @@
+@echo off
+rem Copy to tunnel.local.cmd (gitignored), then fill in your private values.
+set "CONTROL_PLANE_API_KEY=PASTE_YOUR_RUNTIME_API_KEY_HERE"
+set "CONTROL_PLANE_TUNNEL_ID=PASTE_YOUR_TUNNEL_ID_HERE"
+rem Optional overrides (adjust if tunnel-client is installed elsewhere).
+set "TUNNEL_CLIENT_BIN=%~dp0..\..\..\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe"
+set "TUNNEL_PROFILE=desktop-commander"

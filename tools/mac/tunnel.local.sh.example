@@ -1,0 +1,13 @@
+# Copy to tunnel.local.sh (ignored by Git). Never commit your real credentials.
+# OpenAI runtime API key (not a ChatGPT login password).
+CONTROL_PLANE_API_KEY="PASTE_YOUR_RUNTIME_API_KEY_HERE"
+# Tunnel ID created for this Mac. Do not run two devices with the same ID.
+CONTROL_PLANE_TUNNEL_ID="PASTE_YOUR_TUNNEL_ID_HERE"
+# REQUIRED: path to FULL tunnel-client CLI, supporting init and run.
+# The macOS tunnel-client-runtime-cloudflared binary is run-only; it cannot init.
+# Set this to the real full CLI executable path on your Mac.
+TUNNEL_CLIENT_BIN="$HOME/Downloads/tunnel-client-v0.0.16-darwin-arm64/tunnel-client"
+# OPTIONAL: separate run executable; for example the run-only runtime-cloudflared build.
+# TUNNEL_CLIENT_RUN_BIN="$HOME/Downloads/tunnel-client-runtime-cloudflared-v0.0.16-darwin-arm64/tunnel-client-runtime-cloudflared"
+# Profile name shared by tunnel-init.sh and tunnel-run.sh.
+TUNNEL_PROFILE="desktop-commander"
