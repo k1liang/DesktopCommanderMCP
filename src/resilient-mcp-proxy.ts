@@ -2,6 +2,7 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const LEGACY_PROTOCOL_VERSION = '2025-11-25';
@@ -11,6 +12,10 @@ const DEFAULT_PORT = 8765;
 const DEFAULT_REQUEST_TIMEOUT_MS = 4 * 60 * 1000;
 const DEFAULT_INIT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024;
+const DEFAULT_RESULT_PAGE_BYTES = 32 * 1024;
+const DEFAULT_RESULT_PAGE_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_RESULT_PAGE_MAX_ENTRIES = 64;
+const RESULT_PAGE_TOOL_NAME = 'get_result_page';
 
 type JsonRpcId = string | number | null;
 type JsonObject = Record<string, any>;
@@ -21,6 +26,12 @@ type PendingRequest = {
   timer: NodeJS.Timeout;
 };
 
+type CachedPagedResult = {
+  pages: string[];
+  expiresAt: number;
+  originalTool: string;
+};
+
 export type ResilientMcpProxyOptions = {
   host?: string;
   port?: number;
@@ -29,6 +40,9 @@ export type ResilientMcpProxyOptions = {
   requestTimeoutMs?: number;
   initTimeoutMs?: number;
   maxBodyBytes?: number;
+  resultPageBytes?: number;
+  resultPageTtlMs?: number;
+  resultPageMaxEntries?: number;
 };
 
 class ChildDisconnectedError extends Error {
@@ -54,7 +68,80 @@ const KNOWN_READ_ONLY_TOOLS = new Set([
   'get_recent_tool_calls',
   'list_searches',
   'get_more_search_results',
+  RESULT_PAGE_TOOL_NAME,
 ]);
+
+const RESULT_PAGE_TOOL = {
+  name: RESULT_PAGE_TOOL_NAME,
+  description:
+    'Continue a Desktop Commander result that was automatically paginated by the resilient proxy. ' +
+    'When another tool result says has_more=true, call this tool with next_cursor before making any conclusion that depends on omitted content.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      cursor: {
+        type: 'string',
+        description: 'Opaque next_cursor returned by a previously paginated tool result.',
+      },
+    },
+    required: ['cursor'],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+
+function splitUtf8Pages(text: string, maxBytes: number): string[] {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return [text];
+
+  const pages: string[] = [];
+  let start = 0;
+  let end = 0;
+  let bytes = 0;
+
+  while (end < text.length) {
+    const codePoint = text.codePointAt(end) ?? 0;
+    const width = codePoint > 0xffff ? 2 : 1;
+    const charBytes = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+
+    if (bytes + charBytes > maxBytes && end > start) {
+      pages.push(text.slice(start, end));
+      start = end;
+      bytes = 0;
+      continue;
+    }
+
+    bytes += charBytes;
+    end += width;
+  }
+
+  if (start < text.length) pages.push(text.slice(start));
+  return pages;
+}
+
+function paginationFooter(meta: {
+  page: number;
+  totalPages: number;
+  nextCursor: string | null;
+  originalTool: string;
+}): string {
+  const hasMore = meta.nextCursor !== null;
+  return [
+    '',
+    '',
+    '[Desktop Commander result pagination]',
+    hasMore
+      ? `This response is incomplete: page ${meta.page}/${meta.totalPages} from ${meta.originalTool}.`
+      : `This is the final page ${meta.page}/${meta.totalPages} from ${meta.originalTool}.`,
+    `pagination: {"has_more":${hasMore},"next_cursor":${meta.nextCursor ? JSON.stringify(meta.nextCursor) : 'null'},"page":${meta.page},"total_pages":${meta.totalPages}}`,
+    hasMore
+      ? `Call ${RESULT_PAGE_TOOL_NAME} with next_cursor before assuming omitted content is absent. If that tool is unavailable in this conversation, call read_file with path=result-page://${meta.nextCursor}.`
+      : 'No more pages remain.',
+  ].join('\n');
+}
 
 function isRequest(message: JsonObject): boolean {
   return Object.prototype.hasOwnProperty.call(message, 'id');
@@ -99,12 +186,16 @@ export class ResilientChildMcpSession {
   private nextInternalId = 1;
   private initResult: JsonObject | null = null;
   private readonly readOnlyTools = new Map<string, boolean>();
+  private readonly pagedResults = new Map<string, CachedPagedResult>();
   private stopping = false;
 
   readonly childEntry: string;
   readonly childArgs: string[];
   readonly requestTimeoutMs: number;
   readonly initTimeoutMs: number;
+  readonly resultPageBytes: number;
+  readonly resultPageTtlMs: number;
+  readonly resultPageMaxEntries: number;
 
   constructor(options: ResilientMcpProxyOptions = {}) {
     const here = path.dirname(fileURLToPath(import.meta.url));
@@ -113,6 +204,9 @@ export class ResilientChildMcpSession {
     this.childArgs = options.childArgs ?? [];
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.initTimeoutMs = options.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS;
+    this.resultPageBytes = Math.max(1024, Math.floor(options.resultPageBytes ?? DEFAULT_RESULT_PAGE_BYTES));
+    this.resultPageTtlMs = Math.max(1000, Math.floor(options.resultPageTtlMs ?? DEFAULT_RESULT_PAGE_TTL_MS));
+    this.resultPageMaxEntries = Math.max(1, Math.floor(options.resultPageMaxEntries ?? DEFAULT_RESULT_PAGE_MAX_ENTRIES));
   }
 
   get isReady(): boolean {
@@ -138,6 +232,7 @@ export class ResilientChildMcpSession {
     this.ready = false;
     const child = this.child;
     this.child = null;
+    this.pagedResults.clear();
     this.rejectAllPending(new ChildDisconnectedError('Desktop Commander proxy is stopping', false));
     if (child && child.exitCode === null && child.signalCode === null) {
       try { child.kill(); } catch {}
@@ -170,6 +265,26 @@ export class ResilientChildMcpSession {
 
   async handle(message: JsonObject): Promise<JsonObject | null> {
     const method = String(message.method ?? '');
+
+    if (method === 'tools/call' && isRequest(message)) {
+      const toolName = String(message?.params?.name ?? '');
+      if (toolName === RESULT_PAGE_TOOL_NAME) return this.handleResultPageCall(message);
+
+      const legacyPagePath = toolName === 'read_file'
+        ? String(message?.params?.arguments?.path ?? '')
+        : '';
+      if (legacyPagePath.startsWith('result-page://')) {
+        return this.handleResultPageCall({
+          ...message,
+          params: {
+            ...message.params,
+            arguments: {
+              cursor: legacyPagePath.slice('result-page://'.length),
+            },
+          },
+        });
+      }
+    }
 
     if (method === 'initialize' && isRequest(message)) {
       await this.ensureReady();
@@ -241,8 +356,9 @@ export class ResilientChildMcpSession {
           continue;
         }
 
-        this.observeResponse(message, response);
-        return { ...response, id: originalId };
+        const normalized = { ...response, id: originalId };
+        this.observeResponse(message, normalized);
+        return this.decorateResponse(message, normalized);
       } catch (error) {
         const normalized = error instanceof Error ? error : new Error(String(error));
         lastError = normalized;
@@ -272,6 +388,139 @@ export class ResilientChildMcpSession {
       transient: true,
       detail,
     });
+  }
+
+  private decorateResponse(request: JsonObject, response: JsonObject): JsonObject {
+    if (request.method === 'tools/list' && Array.isArray(response?.result?.tools)) {
+      const tools = response.result.tools;
+      if (tools.some((tool: JsonObject) => tool?.name === RESULT_PAGE_TOOL_NAME)) return response;
+      return {
+        ...response,
+        result: {
+          ...response.result,
+          tools: [...tools, RESULT_PAGE_TOOL],
+        },
+      };
+    }
+
+    if (request.method === 'tools/call') return this.paginateToolResponse(request, response);
+    return response;
+  }
+
+  private paginateToolResponse(request: JsonObject, response: JsonObject): JsonObject {
+    if (response.error || response?.result?.isError === true) return response;
+
+    const result = response?.result;
+    const content = result?.content;
+    if (!Array.isArray(content) || content.length !== 1 || result?.structuredContent !== undefined) return response;
+
+    const block = content[0];
+    if (block?.type !== 'text' || typeof block.text !== 'string') return response;
+
+    const totalBytes = Buffer.byteLength(block.text, 'utf8');
+    if (totalBytes <= this.resultPageBytes) return response;
+
+    // Leave enough headroom for the pagination footer so the wire response stays
+    // close to the configured page target instead of exceeding it by a full footer.
+    const textPageBytes = Math.max(512, this.resultPageBytes - 1024);
+    const pages = splitUtf8Pages(block.text, textPageBytes);
+    if (pages.length <= 1) return response;
+
+    this.sweepPagedResults();
+    while (this.pagedResults.size >= this.resultPageMaxEntries) {
+      const oldest = this.pagedResults.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.pagedResults.delete(oldest);
+    }
+
+    const token = randomUUID();
+    const originalTool = String(request?.params?.name ?? 'unknown');
+    this.pagedResults.set(token, {
+      pages,
+      expiresAt: Date.now() + this.resultPageTtlMs,
+      originalTool,
+    });
+
+    const nextCursor = `${token}:1`;
+    const meta = {
+      has_more: true,
+      next_cursor: nextCursor,
+      page: 1,
+      total_pages: pages.length,
+      original_tool: originalTool,
+      total_bytes: totalBytes,
+    };
+
+    process.stderr.write(
+      `[resilient-mcp-proxy] paged ${originalTool} result: ${totalBytes} bytes -> ${pages.length} pages\n`,
+    );
+
+    return {
+      ...response,
+      result: {
+        ...result,
+        content: [{
+          ...block,
+          text: pages[0] + paginationFooter({
+            page: 1,
+            totalPages: pages.length,
+            nextCursor,
+            originalTool,
+          }),
+        }],
+        structuredContent: { pagination: meta },
+      },
+    };
+  }
+
+  private handleResultPageCall(message: JsonObject): JsonObject {
+    this.sweepPagedResults();
+
+    const cursor = String(message?.params?.arguments?.cursor ?? '');
+    const separator = cursor.lastIndexOf(':');
+    const token = separator > 0 ? cursor.slice(0, separator) : '';
+    const pageIndex = separator > 0 ? Number(cursor.slice(separator + 1)) : Number.NaN;
+    const cached = token ? this.pagedResults.get(token) : undefined;
+
+    if (!cached || !Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= cached.pages.length) {
+      return toolFailure(
+        message.id as JsonRpcId,
+        'Invalid or expired result-page cursor. Re-run the original tool only if it is safe/read-only; for side-effecting calls inspect state before retrying.',
+      );
+    }
+
+    const nextCursor = pageIndex + 1 < cached.pages.length ? `${token}:${pageIndex + 1}` : null;
+    const meta = {
+      has_more: nextCursor !== null,
+      next_cursor: nextCursor,
+      page: pageIndex + 1,
+      total_pages: cached.pages.length,
+      original_tool: cached.originalTool,
+    };
+
+    return {
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        content: [{
+          type: 'text',
+          text: cached.pages[pageIndex] + paginationFooter({
+            page: pageIndex + 1,
+            totalPages: cached.pages.length,
+            nextCursor,
+            originalTool: cached.originalTool,
+          }),
+        }],
+        structuredContent: { pagination: meta },
+      },
+    };
+  }
+
+  private sweepPagedResults(): void {
+    const now = Date.now();
+    for (const [token, cached] of this.pagedResults) {
+      if (cached.expiresAt <= now) this.pagedResults.delete(token);
+    }
   }
 
   private isReplaySafe(message: JsonObject): boolean {
@@ -533,6 +782,7 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
           ok: true,
           childReady: session.isReady,
           generation: session.childGeneration,
+          resultPageBytes: session.resultPageBytes,
         });
       }
 
@@ -543,6 +793,7 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
             ok: true,
             childReady: true,
             generation: session.childGeneration,
+            resultPageBytes: session.resultPageBytes,
           });
         } catch (error) {
           return sendJson(res, 503, {
@@ -640,6 +891,9 @@ function parseCliArgs(argv: string[]): ResilientMcpProxyOptions {
     } else if (arg === '--child-entry' && next) {
       options.childEntry = path.resolve(next);
       i += 1;
+    } else if (arg === '--result-page-bytes' && next) {
+      options.resultPageBytes = Number(next);
+      i += 1;
     }
   }
 
@@ -653,6 +907,15 @@ if (entry === self) {
   const options = parseCliArgs(process.argv.slice(2));
   if (!options.host && process.env.DC_RESILIENT_MCP_HOST) options.host = process.env.DC_RESILIENT_MCP_HOST;
   if (options.port === undefined && process.env.DC_RESILIENT_MCP_PORT) options.port = Number(process.env.DC_RESILIENT_MCP_PORT);
+  if (options.resultPageBytes === undefined && process.env.DC_RESILIENT_MCP_RESULT_PAGE_BYTES) {
+    options.resultPageBytes = Number(process.env.DC_RESILIENT_MCP_RESULT_PAGE_BYTES);
+  }
+  if (options.resultPageTtlMs === undefined && process.env.DC_RESILIENT_MCP_RESULT_PAGE_TTL_MS) {
+    options.resultPageTtlMs = Number(process.env.DC_RESILIENT_MCP_RESULT_PAGE_TTL_MS);
+  }
+  if (options.resultPageMaxEntries === undefined && process.env.DC_RESILIENT_MCP_RESULT_PAGE_MAX_ENTRIES) {
+    options.resultPageMaxEntries = Number(process.env.DC_RESILIENT_MCP_RESULT_PAGE_MAX_ENTRIES);
+  }
 
   startResilientMcpProxy(options)
     .then(proxy => {
