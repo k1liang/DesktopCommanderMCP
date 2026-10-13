@@ -20,6 +20,7 @@ assert.match(windowsRun, /tunnel-supervisor\.mjs/, 'Windows run script must laun
 assert.doesNotMatch(windowsRun, /mcp\.stdio-send-initialized-notification/, 'Windows run must not use the stdio lifecycle guard');
 assert.match(windowsInit, /sample_mcp_remote_no_auth/, 'Windows tunnel profile must use an HTTP MCP sample');
 assert.match(windowsInit, /--mcp-server-url/, 'Windows tunnel profile must target the local HTTP proxy');
+assert.match(windowsInit, /call npm install[\s\S]*call npm run build/, 'Windows init must install dependencies before building');
 assert.match(windowsInit, /init --force /, 'Windows init must replace the existing stdio profile during migration');
 assert.match(windowsInit, /--health-listen-addr \"127\.0\.0\.1:0\"/, 'Windows init must avoid colliding with an already-running Tunnel health listener');
 
@@ -28,6 +29,7 @@ assert.match(macRun, /tunnel-supervisor\.mjs/, 'Mac run script must launch tunne
 assert.doesNotMatch(macRun, /mcp\.stdio-send-initialized-notification/, 'Mac run must not use the stdio lifecycle guard');
 assert.match(macInit, /sample_mcp_remote_no_auth/, 'Mac init must use an HTTP MCP sample');
 assert.match(macInit, /--mcp-server-url/, 'Mac init must target the local HTTP proxy');
+assert.match(macInit, /npm install[\s\S]*npm run build/, 'Mac init must install dependencies before building');
 assert.match(macInit, /init --force /, 'Mac init must replace the existing stdio profile');
 assert.match(macInit, /TUNNEL_SUPERVISOR_ONESHOT=1/, 'Mac init doctor must run through a one-shot proxy supervisor');
 

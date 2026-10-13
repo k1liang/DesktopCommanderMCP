@@ -26,7 +26,16 @@ if not exist "%TUNNEL_CLIENT_BIN%" (
     exit /b 1
 )
 where node >nul 2>nul || (echo [ERROR] node not found in PATH. & exit /b 1)
+where npm >nul 2>nul || (echo [ERROR] npm not found in PATH. & exit /b 1)
 pushd "%REPO_DIR%"
+if errorlevel 1 exit /b 1
+echo [INFO] Installing Desktop Commander dependencies...
+call npm install
+if errorlevel 1 (
+    popd
+    exit /b 1
+)
+echo [INFO] Building Desktop Commander...
 call npm run build
 if errorlevel 1 (
     popd

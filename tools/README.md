@@ -47,7 +47,7 @@ macOS:
     ./tools/mac/tunnel-init.sh
     ./tools/mac/tunnel-run.sh
 
-Tunnel init is a one-time operation; run starts the profile subsequently. Use separate Tunnel IDs on devices running simultaneously. Stop run with Ctrl+C.
+Tunnel init automatically runs `npm install` followed by `npm run build` from the repository root before creating the profile (and stops if either step fails). You do not need to run those commands manually before init. Tunnel init is a one-time operation; run starts the profile subsequently. Use separate Tunnel IDs on devices running simultaneously. Stop run with Ctrl+C.
 
 Both platforms use a loopback resilient HTTP MCP proxy (`src/resilient-mcp-proxy.ts`) instead of binding Tunnel directly to Desktop Commander's stdio process. OpenAI tunnel-client intentionally rejects legacy stdio operational requests before they reach the child unless the caller already completed `initialize` + `notifications/initialized`; the local HTTP proxy owns that child lifecycle itself, so cold `tools/list` / `tools/call` requests can recover without surfacing `mcp_initialization_required` to ChatGPT. `tools/tunnel-supervisor.mjs` hosts the proxy and restarts tunnel-client after unexpected exits while keeping the initialized Desktop Commander child alive. Set `TUNNEL_SUPERVISOR_RESTART_DELAY_MS` to change the default 1500 ms restart delay, or `TUNNEL_SUPERVISOR_MAX_RESTARTS` to a positive number to cap retries (0 means unlimited). Configure `DC_RESILIENT_MCP_HOST` and `DC_RESILIENT_MCP_PORT` to adjust the loopback listener; do not expose it to the network because it has no HTTP authentication.
 

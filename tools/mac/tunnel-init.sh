@@ -24,6 +24,9 @@ fi
 
 command -v node >/dev/null || { echo "[ERROR] node not found in PATH" >&2; exit 1; }
 command -v npm >/dev/null || { echo "[ERROR] npm not found in PATH" >&2; exit 1; }
+echo "[INFO] Installing Desktop Commander dependencies..."
+(cd "$REPO_DIR" && npm install)
+echo "[INFO] Building Desktop Commander..."
 (cd "$REPO_DIR" && npm run build)
 
 MCP_PROXY_URL="http://$DC_RESILIENT_MCP_HOST:$DC_RESILIENT_MCP_PORT/mcp"
