@@ -17,6 +17,8 @@ const macInit = fs.readFileSync(path.join(repo, 'tools', 'mac', 'tunnel-init.sh'
 
 assert.match(windowsRun, /TUNNEL_RESILIENT_PROXY=1/, 'Windows run script must enable the resilient HTTP proxy');
 assert.match(windowsRun, /tunnel-supervisor\.mjs/, 'Windows run script must launch tunnel-client through the supervisor');
+assert.match(windowsRun, /TUNNEL_MCP_MAX_CONCURRENT_REQUESTS=4/, 'Windows run should default Tunnel MCP concurrency to 4');
+assert.match(windowsRun, /--mcp\.max-concurrent-requests/, 'Windows run must pass the configured MCP concurrency to tunnel-client');
 assert.doesNotMatch(windowsRun, /mcp\.stdio-send-initialized-notification/, 'Windows run must not use the stdio lifecycle guard');
 assert.match(windowsInit, /sample_mcp_remote_no_auth/, 'Windows tunnel profile must use an HTTP MCP sample');
 assert.match(windowsInit, /--mcp-server-url/, 'Windows tunnel profile must target the local HTTP proxy');

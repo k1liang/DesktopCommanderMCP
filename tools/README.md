@@ -53,6 +53,8 @@ Both platforms use a loopback resilient HTTP MCP proxy (`src/resilient-mcp-proxy
 
 Large plain-text `tools/call` results are automatically paginated by the resilient proxy. The default page target is 32 KiB (`DC_RESILIENT_MCP_RESULT_PAGE_BYTES`), cursors live for 30 minutes (`DC_RESILIENT_MCP_RESULT_PAGE_TTL_MS`), and up to 64 paged results are cached (`DC_RESILIENT_MCP_RESULT_PAGE_MAX_ENTRIES`). The first page contains explicit `has_more` / `next_cursor` metadata and the proxy advertises a read-only `get_result_page` tool for continuation. Small results and non-text/structured results are returned unchanged.
 
+Windows `tunnel-run.bat` also caps the official Tunnel dispatcher with `--mcp.max-concurrent-requests`. The local default is 4 (OpenAI tunnel-client defaults to 10) to reduce bursts of simultaneous tool-result delivery while investigating ChatGPT Web stalls. Override `TUNNEL_MCP_MAX_CONCURRENT_REQUESTS` in the ignored `tools/windows/tunnel.local.cmd` to A/B other values without editing the script.
+
 On macOS, if Gatekeeper blocks a trusted binary, you can opt in to removing its quarantine flag for initialization only:
 
     TUNNEL_TRUST_DOWNLOADED_BINARY=1 ./tools/mac/tunnel-init.sh

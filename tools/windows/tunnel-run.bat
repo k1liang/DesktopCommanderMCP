@@ -21,6 +21,7 @@ if not defined TUNNEL_CLIENT_BIN (
 if not defined TUNNEL_PROFILE set "TUNNEL_PROFILE=desktop-commander"
 if not defined DC_RESILIENT_MCP_HOST set "DC_RESILIENT_MCP_HOST=127.0.0.1"
 if not defined DC_RESILIENT_MCP_PORT set "DC_RESILIENT_MCP_PORT=8765"
+if not defined TUNNEL_MCP_MAX_CONCURRENT_REQUESTS set "TUNNEL_MCP_MAX_CONCURRENT_REQUESTS=4"
 if not exist "%TUNNEL_CLIENT_BIN%" (
     echo [ERROR] tunnel-client executable not found: %TUNNEL_CLIENT_BIN%
     exit /b 1
@@ -38,8 +39,8 @@ if not exist "%REPO_DIR%\dist\resilient-mcp-proxy.js" (
 )
 set "TUNNEL_RESILIENT_PROXY=1"
 echo [INFO] Starting resilient HTTP MCP proxy on %DC_RESILIENT_MCP_HOST%:%DC_RESILIENT_MCP_PORT% ...
-echo [INFO] Starting tunnel profile %TUNNEL_PROFILE% ...
-node "%REPO_DIR%\tools\tunnel-supervisor.mjs" "%TUNNEL_CLIENT_BIN%" run --profile "%TUNNEL_PROFILE%" %*
+echo [INFO] Starting tunnel profile %TUNNEL_PROFILE% with MCP max concurrency %TUNNEL_MCP_MAX_CONCURRENT_REQUESTS% ...
+node "%REPO_DIR%\tools\tunnel-supervisor.mjs" "%TUNNEL_CLIENT_BIN%" run --profile "%TUNNEL_PROFILE%" --mcp.max-concurrent-requests "%TUNNEL_MCP_MAX_CONCURRENT_REQUESTS%" %*
 exit /b %ERRORLEVEL%
 :invalid_config
 echo [ERROR] Set CONTROL_PLANE_API_KEY and CONTROL_PLANE_TUNNEL_ID in tunnel.local.cmd.

@@ -5,6 +5,8 @@ set "CONTROL_PLANE_TUNNEL_ID=PASTE_YOUR_TUNNEL_ID_HERE"
 rem Optional overrides (adjust if tunnel-client is installed elsewhere).
 set "TUNNEL_CLIENT_BIN=%~dp0..\..\..\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe"
 set "TUNNEL_PROFILE=desktop-commander"
+rem Limit Tunnel dispatcher concurrency to reduce bursts of tool-result delivery to ChatGPT Web.
+set "TUNNEL_MCP_MAX_CONCURRENT_REQUESTS=4"
 rem Resilient local HTTP MCP proxy. Loopback only; no inbound firewall port is required.
 set "DC_RESILIENT_MCP_HOST=127.0.0.1"
 set "DC_RESILIENT_MCP_PORT=8765"
