@@ -10,7 +10,7 @@
  */
 
 import { configManager } from '../dist/config-manager.js';
-import { startProcess } from '../dist/tools/improved-process-tools.js';
+import { readProcessOutput, startProcess } from '../dist/tools/improved-process-tools.js';
 import { detectAvailableShells, getDefaultShell, isShellAvailable } from '../dist/utils/shell.js';
 import assert from 'assert';
 import os from 'os';
@@ -29,9 +29,14 @@ async function assertCommandRunsIn(shell) {
   assert.strictEqual(config.defaultShell, shell, `defaultShell should be set to ${shell}`);
 
   const result = await startProcess({ command: `echo ${MARKER}`, timeout_ms: 10000 });
-  const text = result.content?.[0]?.text ?? '';
+  const startText = result.content?.[0]?.text ?? '';
+  const pid = result.structuredContent?.pid;
   assert.strictEqual(result.structuredContent?.shell, shell, `start_process should use ${shell}`);
-  assert(text.includes(MARKER), `Command should run in ${shell} and print ${MARKER}, got: ${text}`);
+  assert(Number.isInteger(pid), `start_process should return a PID, got: ${startText}`);
+
+  const output = await readProcessOutput({ pid, timeout_ms: 2000 });
+  const outputText = output.content?.[0]?.text ?? '';
+  assert(outputText.includes(MARKER), `Command should run in ${shell} and print ${MARKER}, got: ${outputText}`);
 }
 
 /**

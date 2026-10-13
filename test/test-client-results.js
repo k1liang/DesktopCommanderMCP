@@ -38,25 +38,25 @@ async function writePdfIgnoringAnOption(client, dir) {
   console.log('✓ write_pdf: the answer is the same as before, nothing internal is sent');
 }
 
-/** get_config, set_config_value and start_process keep their old descriptions */
+/** get_config and set_config_value describe the configured read/write semantics; start_process hides internal wait details. */
 async function toolDescriptionsAsBefore(client) {
   const { tools } = await client.listTools();
   const description = (name) => tools.find((tool) => tool.name === name)?.description ?? '';
   for (const line of [
-    '- fileReadLineLimit (max lines for read_file, default 1000)',
-    '- fileWriteLineLimit (max lines per write_file call, default 50)',
+    '- fileReadLineLimit (default read_file lines: 5000)',
+    '- fileWriteLineLimit (write/edit warning threshold: 2000; not a hard cap)',
   ]) {
-    assert(description('get_config').includes(line), `get_config's description should still list "${line}"`);
+    assert(description('get_config').includes(line), `get_config's description should list "${line}"`);
   }
   for (const line of [
-    '- fileReadLineLimit (number, max lines for read_file)',
-    '- fileWriteLineLimit (number, max lines per write_file call)',
+    '- fileReadLineLimit (number, default lines when read_file length is omitted)',
+    '- fileWriteLineLimit (number, write/edit warning threshold; not a hard cap)',
   ]) {
-    assert(description('set_config_value').includes(line), `set_config_value's description should still list "${line}"`);
+    assert(description('set_config_value').includes(line), `set_config_value's description should list "${line}"`);
   }
   assert(!/WAIT LIMIT|waitCapped/.test(description('start_process')),
     "start_process's description should not mention the internal wait limit");
-  console.log('✓ get_config, set_config_value, start_process: descriptions as before');
+  console.log('✓ get_config, set_config_value, start_process: descriptions match public behavior');
 }
 
 function assertNothingInternal(tool, result) {

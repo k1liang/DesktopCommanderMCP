@@ -19,21 +19,28 @@ if not defined TUNNEL_CLIENT_BIN (
     exit /b 1
 )
 if not defined TUNNEL_PROFILE set "TUNNEL_PROFILE=desktop-commander"
+if not defined DC_RESILIENT_MCP_HOST set "DC_RESILIENT_MCP_HOST=127.0.0.1"
+if not defined DC_RESILIENT_MCP_PORT set "DC_RESILIENT_MCP_PORT=8765"
 if not exist "%TUNNEL_CLIENT_BIN%" (
     echo [ERROR] Full tunnel-client executable not found: %TUNNEL_CLIENT_BIN%
     exit /b 1
 )
 where node >nul 2>nul || (echo [ERROR] node not found in PATH. & exit /b 1)
-if not exist "%REPO_DIR%\dist\index.js" (
-    echo [ERROR] dist\index.js missing. From repository root run npm install and npm run build.
+pushd "%REPO_DIR%"
+call npm run build
+if errorlevel 1 (
+    popd
     exit /b 1
 )
-set "MCP_ENTRY=%REPO_DIR:\=/%/dist/index.js"
-echo [INFO] Initializing tunnel profile %TUNNEL_PROFILE% ...
-"%TUNNEL_CLIENT_BIN%" init --sample sample_mcp_stdio_local --profile "%TUNNEL_PROFILE%" --tunnel-id "%CONTROL_PLANE_TUNNEL_ID%" --mcp-command "node %MCP_ENTRY%" %*
+popd
+set "MCP_PROXY_URL=http://%DC_RESILIENT_MCP_HOST%:%DC_RESILIENT_MCP_PORT%/mcp"
+echo [INFO] Initializing tunnel profile %TUNNEL_PROFILE% for resilient HTTP MCP proxy...
+"%TUNNEL_CLIENT_BIN%" init --force --sample sample_mcp_remote_no_auth --profile "%TUNNEL_PROFILE%" --tunnel-id "%CONTROL_PLANE_TUNNEL_ID%" --mcp-server-url "%MCP_PROXY_URL%" --health-listen-addr "127.0.0.1:0" %*
 if errorlevel 1 exit /b 1
-echo [INFO] Running tunnel doctor...
-"%TUNNEL_CLIENT_BIN%" doctor --profile "%TUNNEL_PROFILE%" --explain
+echo [INFO] Running tunnel doctor through resilient MCP proxy...
+set "TUNNEL_RESILIENT_PROXY=1"
+set "TUNNEL_SUPERVISOR_ONESHOT=1"
+node "%REPO_DIR%\tools\tunnel-supervisor.mjs" "%TUNNEL_CLIENT_BIN%" doctor --profile "%TUNNEL_PROFILE%" --explain
 exit /b %ERRORLEVEL%
 :invalid_config
 echo [ERROR] Set CONTROL_PLANE_API_KEY and CONTROL_PLANE_TUNNEL_ID in tunnel.local.cmd.

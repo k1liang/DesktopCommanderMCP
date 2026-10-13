@@ -477,7 +477,6 @@ export class TerminalManager {
       // Once the process and its listeners are registered, return the PID
       // immediately. Output remains buffered in the session and is consumed
       // through read_process_output / interact_with_process.
-      session.isBlocked = true;
       exitReason = 'process_started';
       resolveOnce({
         pid: childProcess.pid!,
