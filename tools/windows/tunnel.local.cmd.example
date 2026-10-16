@@ -1,0 +1,12 @@
+@echo off
+rem Copy to tunnel.local.cmd (gitignored), then fill in your private values.
+set "CONTROL_PLANE_API_KEY=PASTE_YOUR_RUNTIME_API_KEY_HERE"
+set "CONTROL_PLANE_TUNNEL_ID=PASTE_YOUR_TUNNEL_ID_HERE"
+rem Optional overrides (adjust if tunnel-client is installed elsewhere).
+set "TUNNEL_CLIENT_BIN=%~dp0..\..\..\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe"
+set "TUNNEL_PROFILE=desktop-commander"
+rem Keep enough Tunnel dispatcher slots for concurrent sessions without restoring the default burst size.
+set "TUNNEL_MCP_MAX_CONCURRENT_REQUESTS=8"
+rem Resilient local HTTP MCP proxy. Loopback only; no inbound firewall port is required.
+set "DC_RESILIENT_MCP_HOST=127.0.0.1"
+set "DC_RESILIENT_MCP_PORT=8765"

@@ -1,5 +1,8 @@
 import { createClient, SupabaseClient, Session, UserResponse, User, RealtimeChannel } from '@supabase/supabase-js';
 import { captureRemote } from '../utils/capture.js';
+import { observeTransport } from './transport-telemetry.js';
+import { RealtimeHealthTelemetry } from './realtime-health-telemetry.js';
+import { rolloutManager } from './rollouts.js';
 import { VERSION } from '../version.js';
 
 const NUL_CHAR = String.fromCharCode(0);
@@ -37,6 +40,20 @@ export interface AuthSession {
     device_id?: string;
 }
 
+/**
+ * The device registered, but its realtime channel is not usable — the join
+ * failed, or presence was never acknowledged. Distinct from every other
+ * registration failure on purpose: this one the socket watchdog can repair, so
+ * the caller keeps the process alive, while a failed lookup or a missing row
+ * happens before the recreation parameters are stored and nothing can repair it.
+ */
+export class ChannelUnreachableError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'ChannelUnreachableError';
+    }
+}
+
 interface DeviceData {
     user_id: string;
     device_name: string;
@@ -50,9 +67,30 @@ interface DeviceData {
 // capable -> 15 min, unflagged -> 45s.
 const CAPABLE_HEARTBEAT_INTERVAL = 5 * 60 * 1000;
 const LEGACY_HEARTBEAT_INTERVAL = 15 * 1000;
+// Fast recovery for short Wi-Fi blips, but never retry every 10 seconds forever.
+// Prolonged provider incidents must not keep the entire device fleet joining.
+// Independent jitter spreads retry work; full jitter applies at attempt >= 5.
+const REALTIME_RECONNECT_BASE_MS = [1000, 2000, 5000, 10000, 20000, 40000, 80000, 120000] as const;
+const REALTIME_RECONNECT_FALLBACK_MS = 120000;
+const WATCHDOG_RECREATE_MAX_BACKOFF_MS = 120000;
+// Presence-only failures do not mean broadcast delivery is down: a joined
+// channel can still receive doorbells while Presence's DB-backed work is
+// degraded. Keep a previously-proven capability for one normal heartbeat
+// interval before falling back to the 15s legacy tier, avoiding a 20x heartbeat
+// write-rate jump during short provider incidents.
+const PRESENCE_WITHDRAW_GRACE_MS = 5 * 60 * 1000;
 // Cap on a recreate's rebuild step so a hung await can't disable the watchdog.
-// Must exceed createChannel()'s worst case (~31.5s of presence retries).
+// Must exceed createChannel()'s worst case (~32.25s of jittered presence retries).
 const RECREATE_TIMEOUT_MS = 45000;
+// Upper bound on the persistent unready-join budget. Anything >= 8 already
+// selects the 120s SDK tier; the cap only keeps the counter meaningful.
+const MAX_UNREADY_JOIN_BUDGET = 16;
+// A channel that has stayed joined this long, with a heartbeat confirmed after
+// the join, is a working broadcast path even if Presence is still degraded.
+// Its join no longer counts toward reconnect backoff (Presence keeps its own
+// cooldown). Comfortably longer than the incident's join->error cycle (~10-30s)
+// and covers at least four 25s heartbeats.
+const STABLE_BROADCAST_RESET_MS = 120_000;
 // Max continuous time in 'joining' before forcing a recreate — a half-open
 // socket parks the channel there forever, and a genuine join settles in ~10s.
 const JOINING_WEDGE_TIMEOUT_MS = 30000;
@@ -71,6 +109,11 @@ const TRANSPORT_WITHDRAW_AFTER_ATTEMPTS = 3;
 // Cap on the withdrawal write; it runs in a catch block RECREATE_TIMEOUT_MS
 // does not cover.
 const CAPABILITY_WRITE_TIMEOUT_MS = 5000;
+// Cap on one write to this device's row (capability, status), after which it
+// is aborted. A PATCH sent down a half-open connection is otherwise answered
+// only by fetch's own 300 s headers timeout, and the write queue behind it,
+// with the presence publish waiting on that queue, waits as long.
+const DEVICE_ROW_WRITE_TIMEOUT_MS = 10_000;
 // Cap on the shutdown session fetch, which races device.ts's 5s force-exit.
 const OFFLINE_SESSION_TIMEOUT_MS = 500;
 // realtime-js parks in 'disconnecting' for ~100ms after a disconnect and
@@ -79,6 +122,45 @@ const OFFLINE_SESSION_TIMEOUT_MS = 500;
 // already covers.
 const SOCKET_SETTLE_MAX_MS = 300;
 const SOCKET_SETTLE_POLL_MS = 20;
+// Reconnect recovery is a safety net, not the primary transport. Bound each
+// scan so a pathological backlog cannot turn one reconnect into an unbounded
+// burst of REST claims/tool executions.
+const PENDING_RECOVERY_BATCH_SIZE = 100;
+
+function jitterAround(baseMs: number, random: () => number): number {
+    const sample = Math.max(0, Math.min(1, random()));
+    return Math.max(1, Math.round(baseMs * (0.5 + sample)));
+}
+
+/** Exponential-ish SDK backoff. Attempts 1-4 preserve short recovery latency. */
+export function realtimeReconnectDelayMs(tries: number, random: () => number = Math.random): number {
+    const attempt = Math.max(1, Math.floor(tries || 1));
+    const baseMs = REALTIME_RECONNECT_BASE_MS[attempt - 1] ?? REALTIME_RECONNECT_FALLBACK_MS;
+    if (attempt <= 4) return jitterAround(baseMs, random);
+    // Full jitter is deliberately independent per device; floor avoids an immediate tight retry.
+    return Math.max(1000, Math.round(baseMs * Math.max(0, Math.min(1, random()))));
+}
+
+/** Watchdog must not defeat the SDK's slower persistent-failure backoff. */
+export function watchdogRecreateDelayMs(tries: number, random: () => number = Math.random): number {
+    const attempt = Math.max(1, Math.floor(tries || 1));
+    const baseMs = Math.min(WATCHDOG_RECREATE_MAX_BACKOFF_MS, 1000 * 2 ** Math.min(attempt, 7));
+    return jitterAround(baseMs, random);
+}
+
+/** Preserve short in-batch Presence retries, independently jittered. */
+export function presenceRetryDelayMs(failedAttempt: number, random: () => number = Math.random): number {
+    const attempt = Math.max(1, Math.floor(failedAttempt || 1));
+    return jitterAround(500 * attempt, random);
+}
+
+/** Delay new Presence batches after repeated failed batches, even across SDK rejoins.
+ * This is intentionally independent of the Phoenix channel/socket reconnect timer. */
+export function presenceRecoveryDelayMs(failures: number, random: () => number = Math.random): number {
+    const attempt = Math.max(1, Math.floor(failures || 1));
+    const baseMs = Math.min(120_000, 5_000 * 2 ** Math.min(attempt - 1, 5));
+    return Math.max(1_000, Math.round(baseMs * Math.max(0, Math.min(1, random()))));
+}
 
 // auth-js compares token expiry against this device's own Date.now(), with no
 // clock-skew tolerance — a fast clock treats every fresh token as expired and
@@ -95,7 +177,6 @@ const SOCKET_SETTLE_POLL_MS = 20;
 const rawDateNow = Date.now;
 let clockOffsetMs = 0;
 let clockPatched = false;
-
 export function observeServerDate(dateHeader: string | null): void {
     if (!dateHeader) return;
     const serverMs = Date.parse(dateHeader);
@@ -134,6 +215,12 @@ export class RemoteChannel {
     private heartbeatDeviceId: string | null = null;
     // Single-slot queue keeping concurrent `status` PATCHes in order.
     private statusWriteChain: Promise<void> = Promise.resolve();
+    /**
+     * Answers whether the local execution child is alive. Default yes, so a
+     * RemoteChannel used without a device (tests, other callers) behaves as
+     * before; MCPDevice installs the real probe.
+     */
+    private localExecutorProbe: () => boolean = () => true;
     /** Tokens from the last setSession / TOKEN_REFRESHED, for setOffline(). */
     private lastKnownSession: { access_token: string; refresh_token: string | null } | null = null;
     /** Notified when auth-js rotates the session; the device persists it. */
@@ -157,9 +244,32 @@ export class RemoteChannel {
     private presenceTracked = false;
     /** Last capability value written (null = never), to avoid redundant writes. */
     private transportCapableWritten: boolean | null = null;
+    /** Value of the last capability write still queued or in flight; null once the queue is idle. */
+    private transportCapableQueued: boolean | null = null;
+    // Single-slot queue keeping capability writes in order (see setTransportCapable).
+    private capabilityWriteChain: Promise<unknown> = Promise.resolve();
+    /** Monotonic start of a Presence-only degradation while broadcast remains joined. */
+    private presenceFailureStartedAt: number | null = null;
     /** Re-entrancy guard: on a wedged socket each track() buffers for the full
      * 10s push timeout, so 10s health ticks would stack pushes. */
     private isTrackingPresence = false;
+    // The SDK resets its rejoin timer on *every* SUBSCRIBED, even if Presence
+    // immediately times out. Count such joins across SDK/channel recreation.
+    // Reset only after Presence AND durable readiness writes succeed.
+    private consecutiveUnreadyJoins = 0;
+    private consecutivePresenceFailures = 0;
+    private nextPresenceAttemptAt = 0; // monotonic; independent of Date.now skew correction
+    /** performance.now() of the latest SUBSCRIBED; null while not joined. */
+    private joinedAt: number | null = null;
+
+    /** SDK channel and socket timers share reconnectAfterMs. The persistent
+     * unready-join budget prevents a series of partial successes restarting at 1s. */
+    private reconnectDelayMs(tries: number, random: () => number = Math.random): number {
+        return realtimeReconnectDelayMs(Math.max(tries, this.consecutiveUnreadyJoins), random);
+    }
+    private readonly realtimeHealth = new RealtimeHealthTelemetry((window) => {
+        captureRemote('remote_realtime_health_window', window).catch(() => {});
+    });
 
     // Track last device status to prevent duplicate log messages
     private lastDeviceStatus: 'online' | 'offline' = 'offline';
@@ -192,21 +302,12 @@ export class RemoteChannel {
             auth: { autoRefreshToken: false },
             global: { fetch: clockAwareFetch },
             realtime: {
+                reconnectAfterMs: (tries: number) => this.reconnectDelayMs(tries),
                 // supabase-js's resolver ends in `?? supabaseKey`, so after SIGNED_OUT
                 // the socket silently re-pins to the anon key and every private-channel
                 // join is refused. Overriding under `realtime` (not the top-level
                 // `accessToken`, which turns client.auth into a throwing Proxy).
-                // getSession() may refresh on-demand when the token reads expired —
-                // that check is clock-skew-safe now (see clockAwareFetch above).
-                accessToken: async (): Promise<string | null> => {
-                    try {
-                        const { data } = await this.client!.auth.getSession();
-                        if (data.session?.access_token) return data.session.access_token;
-                    } catch {
-                        /* fall through to the cached token */
-                    }
-                    return this.lastKnownSession?.access_token ?? null;
-                },
+                accessToken: () => this.getAccessToken(),
             },
         });
         if (!this.heartbeatListenerRegistered) {
@@ -217,6 +318,15 @@ export class RemoteChannel {
                 });
             } catch { /* no onHeartbeat on this client version: staleness check stays inert */ }
         }
+    }
+
+    /**
+     * Teach the channel how to ask whether the local executor is alive.
+     * `status` is a claim that this device will run a tool call right now, and
+     * a joined channel alone cannot support that claim - issue #4.
+     */
+    setLocalExecutorProbe(probe: () => boolean) {
+        this.localExecutorProbe = probe;
     }
 
     /**
@@ -353,6 +463,8 @@ export class RemoteChannel {
             });
 
             this.stopHeartbeat();
+            // Without a session the 30-minute rollouts request can only be refused
+            rolloutManager.stopRefresh();
 
             // Tear realtime down entirely, same as recreateChannel() does: sessionLost
             // only gates OUR health loop, while realtime-js keeps its own per-channel
@@ -386,6 +498,23 @@ export class RemoteChannel {
     async getSession(): Promise<{ data: { session: Session | null }; error: any }> {
         if (!this.client) throw new Error('Client not initialized');
         return await this.client.auth.getSession();
+    }
+
+    /**
+     * The session's current access token, for the realtime socket and the
+     * device's own requests. getSession() may refresh on-demand when the token
+     * reads expired — that check is clock-skew-safe now (see clockAwareFetch
+     * above). Without a session it falls back to the last token known, and
+     * without that it is null, never the anon key.
+     */
+    async getAccessToken(): Promise<string | null> {
+        try {
+            const { data } = await this.client!.auth.getSession();
+            if (data.session?.access_token) return data.session.access_token;
+        } catch {
+            /* fall through to the cached token */
+        }
+        return this.lastKnownSession?.access_token ?? null;
     }
 
     async findDevice(deviceId: string) {
@@ -452,18 +581,35 @@ export class RemoteChannel {
         }
 
         if (existingDevice) {
-            console.debug('[DEBUG] Updating device status to online');
-            // transport_broadcast_v1 is NOT set here: the server treats it as
-            // binding, so it is written only once presence is proven.
-            await this.updateDevice(existingDevice.id, {
-                status: 'online',
-                last_seen: new Date().toISOString(),
+            console.debug('[DEBUG] Registering device as offline until the channel proves otherwise');
+            // Neither half of this row may claim reachability yet. transport_
+            // broadcast_v1 is NOT set here: the server treats it as binding, so
+            // it is written only once presence is proven. `status` is the same
+            // promise in the other notation — dispatch picks its target by it,
+            // then fails the call fast for the missing capability, so a row
+            // marked online before the channel is up hands every call in that
+            // window to a device with no delivery path. SUBSCRIBED writes
+            // 'online'; presence writes the capability.
+            const { error: registrationError } = await this.updateDevice(existingDevice.id, {
+                status: 'offline',
+                last_seen: 'now',
                 capabilities: this.capabilitiesPayload(false),
                 device_name: deviceName
             });
 
+            // updateDevice() logs and returns its error rather than throwing.
+            // Opening the channel anyway would leave a row that still says
+            // whatever the last run left there — including 'online' — while
+            // nothing here can correct it: the channel's own error path queues
+            // an offline write, and setOnlineStatus() only logs when that write
+            // fails too. Stop before the channel instead.
+            if (registrationError) {
+                throw new Error(`Failed to register device: ${registrationError.message}`);
+            }
+
             // Store parameters for channel recreation
             this.deviceId = existingDevice.id;
+            this.realtimeHealth.setDevice(existingDevice.id);
             this.deviceName = deviceName;
             this.onToolCall = onToolCall;
 
@@ -472,9 +618,13 @@ export class RemoteChannel {
             // Create and subscribe to the channel
             console.debug('[DEBUG] Calling createChannel()');
 
-            await this.createChannel().catch((error) => {
-                console.debug(`[DEBUG] Failed to create channel, will retry after socket reconnect: ${error?.message || error} — ${this.connState()}`);
-            });
+            // Let a failed join reach the caller. createChannel() resolves only
+            // once the channel is joined AND presence is published — the two
+            // things dispatch needs — so swallowing its rejection here was what
+            // let device.ts print "Device ready" over a device that cannot
+            // receive a single command. The caller decides what to do with it;
+            // it is not fatal, the socket watchdog keeps retrying.
+            await this.createChannel();
 
         } else {
             console.error(`   - ❌ Device not found: ${currentDeviceId}`);
@@ -490,6 +640,9 @@ export class RemoteChannel {
      */
     private async trackPresenceWithRetry(recovered: number, attempts = 3): Promise<void> {
         if (this.isTrackingPresence) return; // never stack pushes on a wedged socket
+        // SDK may deliver SUBSCRIBED again before Presence's separate cooldown
+        // expires. Do not let each successful join bypass that cooldown.
+        if (this.presenceInCooldown()) return;
         this.isTrackingPresence = true;
         try {
             await this.trackPresenceInner(recovered, attempts);
@@ -498,12 +651,43 @@ export class RemoteChannel {
         }
     }
 
+    /** One failed Presence batch: grow the Presence-only cooldown. Deadlines are
+     * monotonic so a Date.now skew correction cannot shorten or extend them. */
+    private recordPresenceBatchFailure(): void {
+        this.consecutivePresenceFailures++;
+        this.nextPresenceAttemptAt = performance.now() +
+            presenceRecoveryDelayMs(this.consecutivePresenceFailures);
+    }
+
+    /** Presence is withheld by its cooldown right now. */
+    private presenceInCooldown(): boolean {
+        return performance.now() < this.nextPresenceAttemptAt;
+    }
+
     private async trackPresenceInner(recovered: number, attempts: number): Promise<void> {
+        // A fresh attempt starts from "not proven", so a leftover true from an
+        // earlier join cannot keep the device counting as reachable while this
+        // one is still deciding.
+        this.presenceTracked = false;
+        // Every await below can outlive this channel (recreateChannel() swaps
+        // it). A late result must not touch retry state the newer channel owns.
+        const channel = this.channel;
+        let failedAttempts = 0;
+
         for (let attempt = 1; attempt <= attempts; attempt++) {
-            if (!this.channel || this.channel.state !== 'joined') return;
+            if (this.channel !== channel) return;
+            if (!channel || channel.state !== 'joined') {
+                // Production sequence (2026-10-13): track() times out, then the
+                // channel errors before the next in-batch attempt. That batch
+                // failed too; without recording it the next SUBSCRIBED would
+                // publish again with no cooldown at all.
+                if (failedAttempts > 0) this.recordPresenceBatchFailure();
+                return;
+            }
             let status: string;
+            this.realtimeHealth.record('presence_attempts');
             try {
-                status = await this.channel.track({
+                status = await channel.track({
                     device_id: this.deviceId,
                     device_name: this.deviceName,
                     app_version: VERSION,
@@ -512,28 +696,109 @@ export class RemoteChannel {
             } catch (trackErr: any) {
                 status = `threw: ${trackErr?.message}`;
             }
+            if (this.channel !== channel) return; // stale ack/timeout from a replaced channel
 
             if (status === 'ok') {
+                this.realtimeHealth.record('presence_successes');
+                // `presenceTracked` is not "track() said ok" — isReachable()
+                // reads it as "this device receives commands", and the heartbeat
+                // consults isReachable() directly rather than waiting for the
+                // sequence below. Raising it here let a heartbeat firing while
+                // these writes were in flight assert `online` over a row with no
+                // capability recorded: the very state this is meant to remove.
+                // So it is raised last, when every claim it makes is already true.
+                //
+                // Both writes have to land. Supabase reports a refused write in
+                // the result rather than by throwing, and a device whose row
+                // records neither the capability nor `online` is exactly as
+                // undispatchable as one that never published presence. The
+                // health check retries presence while this stays false, which is
+                // the way back.
+                const capabilityWritten = await this.setTransportCapable(true);
+                // Strictly after, never alongside: `online` may be claimed only
+                // where the capability is already advertised, or the row lands
+                // back in the state this whole change is about.
+                // Not syncReachabilityStatus(): its predicate reads presenceTracked,
+                // and that flag is deliberately still false here - it is raised last,
+                // once these writes have landed, so a heartbeat cannot advertise the
+                // row mid-sequence. Both halves the predicate asks about are already
+                // known at this point: the channel is joined and presence was just
+                // acknowledged. The only open question is the local executor, so ask
+                // that directly - a joined, present device whose executor is dead must
+                // not be advertised either.
+                const statusWritten = capabilityWritten
+                    ? await this.queueStatusWrite(this.localExecutorProbe() ? 'online' : 'offline')
+                    : false;
+                if (!capabilityWritten || !statusWritten) {
+                    console.error('❌ Presence published but the device row could not be updated — not ready');
+                    this.realtimeHealth.record('readiness_write_failures');
+                    captureRemote('remote_channel_readiness_write_failed', {
+                        capabilityWritten, statusWritten
+                    }).catch(() => { });
+                    return;
+                }
+                // Writes can take up to DEVICE_ROW_WRITE_TIMEOUT_MS each; if the
+                // channel was replaced meanwhile, its own join decides readiness.
+                if (this.channel !== channel) return;
+
                 this.presenceTracked = true;
+                // A joined socket is only a partial recovery. Clear backoff
+                // after Presence and both readiness writes have succeeded.
+                this.consecutiveUnreadyJoins = 0;
+                this.consecutivePresenceFailures = 0;
+                this.nextPresenceAttemptAt = 0;
+                this.presenceFailureStartedAt = null;
                 console.log(`👋 Presence tracked (device ${this.deviceId} visible as online)`);
                 // Reconnect attempts preceding this join (0 on a first join).
                 captureRemote('remote_channel_presence_tracked', { recoveredAfterAttempts: recovered }).catch(() => { });
-                // Proven end-to-end (joined AND presence published) — only now
-                // advertise the capability dispatch requires.
-                await this.setTransportCapable(true);
+
+                // Broadcast is only a wake-up signal; mcp_remote_calls is the
+                // durable queue. A call inserted while this socket was briefly
+                // disconnected can miss its one new_call doorbell and otherwise
+                // stay pending until the server reaper times it out. Drain that
+                // durable backlog whenever the channel becomes genuinely usable.
+                // Fire-and-forget so readiness does not wait on backlog recovery;
+                // each row still goes through the atomic pending -> executing
+                // claim, so a late/duplicate doorbell can safely race this scan.
+                this.recoverPendingCalls().catch((error: any) => {
+                    console.error('[DEBUG] Pending call recovery failed:', error?.message);
+                });
                 return;
             }
 
+            failedAttempts++;
             console.error(`❌ Presence track not acknowledged (${status}) — attempt ${attempt}/${attempts}`);
-            if (attempt < attempts) await this.sleep(500 * attempt);
+            this.realtimeHealth.record('presence_failures');
+            if (attempt < attempts) await this.sleep(presenceRetryDelayMs(attempt));
         }
+        if (this.channel !== channel) return;
 
         this.presenceTracked = false;
-        console.error('❌ Presence track failed after retries — withdrawing broadcast capability');
+        this.recordPresenceBatchFailure();
         captureRemote('remote_channel_presence_track_error', { attempts }).catch(() => { });
-        // Withdraw: the dashboard reads a flagged device with no presence as
-        // offline. The faster heartbeat tier keeps the device's DB status
-        // accurate while it recovers.
+
+        // Presence is an observer signal, not the delivery path. If this device
+        // already proved broadcast capability and the channel is still joined,
+        // keep that capability through a short provider-side Presence incident
+        // instead of immediately switching to the 15s legacy heartbeat tier.
+        // The 10s health check keeps retrying Presence; a success clears the
+        // timer. Genuine channel failure is handled separately by
+        // recreateChannel(), which still withdraws after 3 failed recreates.
+        if (this.transportCapableWritten === true && this.channel?.state === 'joined') {
+            const now = performance.now();
+            if (this.presenceFailureStartedAt === null) this.presenceFailureStartedAt = now;
+            const degradedForMs = now - this.presenceFailureStartedAt;
+            if (degradedForMs < PRESENCE_WITHDRAW_GRACE_MS) {
+                console.warn(
+                    `⚠️ Presence unavailable for ${Math.round(degradedForMs / 1000)}s — ` +
+                    `retaining broadcast capability during ${PRESENCE_WITHDRAW_GRACE_MS / 1000}s grace`
+                );
+                return;
+            }
+        }
+
+        this.presenceFailureStartedAt = null;
+        console.error('❌ Presence track remained unavailable — withdrawing broadcast capability');
         await this.setTransportCapable(false);
     }
 
@@ -552,19 +817,43 @@ export class RemoteChannel {
      * Advertise (or withdraw) the broadcast capability. Only true while genuinely
      * reachable that way — the server fails dispatch fast without it and picks
      * the offline-sweep tier from it, so every change must re-arm the heartbeat.
+     *
+     * Writes are queued, like the status writes. A withdrawal the recreate stops
+     * waiting for still lands: compared with the last landed value, a re-publish
+     * in the meantime looked redundant and was skipped, and the withdrawal then
+     * left a device that claims to be online without the flag. Resolves with
+     * whether the row holds `capable` once this write is done.
      */
-    private async setTransportCapable(capable: boolean): Promise<void> {
-        if (!this.client || !this.deviceId) return;
-        if (this.transportCapableWritten === capable) return; // no redundant writes
+    private setTransportCapable(capable: boolean): Promise<boolean> {
+        if (!this.client || !this.deviceId) return Promise.resolve(false);
+        // What the row holds once the queue drains — no redundant writes.
+        if ((this.transportCapableQueued ?? this.transportCapableWritten) === capable) {
+            return this.capabilityWriteChain.then(() => this.transportCapableWritten === capable);
+        }
+        this.transportCapableQueued = capable;
+        const write = this.capabilityWriteChain.then(() => this.writeTransportCapable(capable));
+        this.capabilityWriteChain = write;
+        write.then(() => {
+            if (this.capabilityWriteChain === write) this.transportCapableQueued = null;
+        });
+        return write;
+    }
+
+    private async writeTransportCapable(capable: boolean): Promise<boolean> {
+        if (!this.client || !this.deviceId) return false;
         try {
             const capabilities = this.capabilitiesPayload(capable);
             const { error } = await this.client
                 .from('mcp_devices')
                 .update({ capabilities })
-                .eq('id', this.deviceId);
+                .eq('id', this.deviceId)
+                .abortSignal(this.deviceRowWriteSignal());
             if (error) {
                 console.error('[DEBUG] Failed to update transport capability:', error.message);
-                return;
+                // An aborted write may still land: what the row holds is
+                // unknown, so the next write of either value is not skipped.
+                this.transportCapableWritten = null;
+                return false;
             }
             this.transportCapableWritten = capable;
             console.debug(`[DEBUG] Transport capability set to ${capable ? 'broadcast_v1' : 'withdrawn'}`);
@@ -578,7 +867,15 @@ export class RemoteChannel {
             }
         } catch (error: any) {
             console.error('[DEBUG] Transport capability update threw:', error?.message);
+            this.transportCapableWritten = null;
+            return false;
         }
+        return true;
+    }
+
+    /** Aborts one write to this device's row after DEVICE_ROW_WRITE_TIMEOUT_MS (a method, so tests can shorten it). */
+    private deviceRowWriteSignal(): AbortSignal {
+        return AbortSignal.timeout(DEVICE_ROW_WRITE_TIMEOUT_MS);
     }
 
     /** Create and subscribe the private channel (initial join and recreation). */
@@ -595,6 +892,7 @@ export class RemoteChannel {
             // Presence, keyed by device id.
             const channelName = `user:${this.user.id}`;
             console.debug(`[DEBUG] Creating channel: ${channelName}`);
+            this.realtimeHealth.newChannel();
             this.channel = this.client.channel(channelName, {
                 config: {
                     private: true,
@@ -606,6 +904,10 @@ export class RemoteChannel {
                     'broadcast',
                     { event: 'new_call' },
                     ({ payload }: any) => {
+                        if (!this.shuttingDown) {
+                            observeTransport({ stage: 'received', payload, deviceId: this.deviceId,
+                                userId: this.user?.id, transport: 'broadcast' });
+                        }
                         this.onDoorbell(payload).catch((e: any) => {
                             console.error('[DEBUG] Doorbell handling failed:', e?.message);
                         });
@@ -616,43 +918,120 @@ export class RemoteChannel {
                     console.debug(`[DEBUG] Channel subscription status: ${status}${err ? ' (error: ' + (err?.message || err) + ')' : ''} — ${this.connState()}`);
 
                     if (status === 'SUBSCRIBED') {
+                        this.realtimeHealth.record('join_successes');
+                        // The SDK resets its rejoinTimer here regardless of Presence.
+                        // Carry failure budget across successful-but-unready joins.
+                        // reconnectAttempt is different: it counts watchdog
+                        // recreations (and gates capability withdrawal), and a
+                        // join does end that particular failure mode.
+                        this.consecutiveUnreadyJoins = Math.min(
+                            MAX_UNREADY_JOIN_BUDGET, this.consecutiveUnreadyJoins + 1
+                        );
                         const recovered = this.reconnectAttempt;
-                        this.reconnectAttempt = 0;
-                        this.lastHeartbeatOkAt = performance.now(); // a fresh join is proof of life too
+                        this.reconnectAttempt = 0; // watchdog attempts only, not recovery proof
+                        const joinedAt = performance.now();
+                        this.joinedAt = joinedAt;
+                        this.lastHeartbeatOkAt = joinedAt; // a fresh join is proof of life too
                         console.log(`✅ Channel subscribed${recovered > 0 ? ` (recovered after ${recovered} attempt${recovered === 1 ? '' : 's'})` : ''}`);
-                        // Update device status on successful connection (queued, so
-                        // it can't be overtaken by a teardown's status write).
-                        this.queueStatusWrite('online');
-                        // The capability flag dispatch requires is written only
-                        // once presence lands, so resolve then — otherwise
-                        // registerDevice() reports "Device ready" while still
-                        // undispatchable.
+                        // A join is only half of what dispatch needs. The other
+                        // half is presence, which writes the capability the
+                        // server checks — and when every track() is refused,
+                        // trackPresenceInner() withdraws the capability and
+                        // returns normally. Resolving here regardless left the
+                        // row online with the capability withdrawn: the exact
+                        // state the server refuses as not_broadcast_capable.
+                        // `status` is written on the same event as the
+                        // capability, in trackPresenceInner, so the two can
+                        // never disagree.
+                        //
+                        // During a Presence cooldown no publish is attempted.
+                        // The promise still rejects (the device is not ready),
+                        // but the joined channel itself is left in place: the
+                        // health check treats 'joined' as healthy and only
+                        // retries Presence once the cooldown expires.
+                        const deferred = this.presenceInCooldown();
                         this.trackPresenceWithRetry(recovered)
                             .catch(() => { /* logged inside */ })
-                            .finally(() => resolve());
+                            .finally(() =>
+                                this.presenceTracked
+                                    ? resolve()
+                                    : reject(new ChannelUnreachableError(deferred
+                                        ? 'channel joined; presence deferred by cooldown after repeated failures'
+                                        : 'channel joined but presence was never acknowledged, so no command can be delivered'
+                                    ))
+                            );
                     } else if (status === 'CHANNEL_ERROR') {
+                        this.realtimeHealth.record('join_errors');
                         // CHANNEL_ERROR is the only status carrying a real error message.
                         console.error(`❌ Channel error: ${err?.message || 'unknown'} — ${this.connState()}`);
+                        this.joinedAt = null;
                         this.presenceTracked = false;
                         this.syncReachabilityStatus();
                         // Fires on ordinary network faults too — filter on the
                         // error text to isolate an 008 misconfiguration.
                         captureRemote('remote_channel_subscription_error', { error: err?.message || 'Channel error' }).catch(() => { });
-                        reject(err || new Error('Failed to initialize tool call channel subscription'));
+                        reject(new ChannelUnreachableError(err?.message || 'failed to subscribe to the tool call channel'));
                     } else if (status === 'TIMED_OUT') {
+                        this.realtimeHealth.record('join_timeouts');
                         console.error(`⏱️ Channel subscription timed out, Reconnecting... — ${this.connState()}`);
                         this.syncReachabilityStatus();
                         captureRemote('remote_channel_subscription_timeout', { attempt: this.reconnectAttempt }).catch(() => { });
-                        reject(new Error('Tool call channel subscription timed out'));
+                        reject(new ChannelUnreachableError('tool call channel subscription timed out'));
                     } else if (status === 'CLOSED') {
+                        this.realtimeHealth.record('join_closures');
                         // Settle the promise so an in-flight recreateChannel() can't await
                         // forever (which would wedge the re-entrancy guard / watchdog).
                         console.warn(`⚠️ Channel closed — ${this.connState()}`);
                         this.syncReachabilityStatus();
-                        reject(new Error('Tool call channel closed during subscribe'));
+                        reject(new ChannelUnreachableError('tool call channel closed during subscribe'));
                     }
                 });
         });
+    }
+
+    /**
+     * Recover calls whose Realtime doorbell was missed while this device was
+     * disconnected. Broadcast provides the fast path; the DB row is the source
+     * of truth. Only still-live pending rows for this device are considered.
+     *
+     * The follow-up onDoorbell() call performs the existing conditional claim,
+     * which makes this safe against a doorbell arriving at the same time.
+     */
+    private async recoverPendingCalls(): Promise<void> {
+        if (!this.client || !this.deviceId || !this.isReachable()) return;
+
+        const { data: pending, error } = await this.client
+            .from('mcp_remote_calls')
+            .select('id,device_id')
+            .eq('device_id', this.deviceId)
+            .eq('status', 'pending')
+            .gt('timeout_at', 'now')
+            .order('created_at', { ascending: true })
+            .limit(PENDING_RECOVERY_BATCH_SIZE);
+
+        if (error) {
+            console.error('[DEBUG] Failed to query pending calls after reconnect:', error.message);
+            await captureRemote('remote_channel_pending_recovery_error', { error });
+            return;
+        }
+
+        if (!pending?.length) return;
+
+        console.log(`♻️  Recovering ${pending.length} pending remote call${pending.length === 1 ? '' : 's'} after reconnect`);
+        captureRemote('remote_channel_pending_recovery', {
+            pending_count: pending.length,
+            batch_capped: pending.length === PENDING_RECOVERY_BATCH_SIZE,
+        }).catch(() => { });
+
+        // Claim quickly; dispatchToolCall() does not await tool execution, so
+        // this loop serializes only the small REST claim operations.
+        for (const row of pending) {
+            if (!this.isReachable()) break;
+            await this.onDoorbell({
+                call_id: row.id,
+                device_id: row.device_id,
+            });
+        }
     }
 
     /** Hand a call to device.ts, observing the rejection — the handler is async
@@ -691,7 +1070,9 @@ export class RemoteChannel {
 
         // Retry on transient failures (a REST blip while the socket stays
         // healthy). This claim is the only way we learn about a call,
-        // so a hiccup must not cost a 5-minute timeout.
+        // so a hiccup must not cost a timeout. PostgREST interprets the
+        // special timestamptz input 'now' in PostgreSQL, not on the device;
+        // this atomically excludes expired rows despite client clock skew.
         let row: any = null;
         let claimError: any = null;
         for (const delayMs of [0, 500, 1500]) {
@@ -702,6 +1083,7 @@ export class RemoteChannel {
                 .eq('id', callId)
                 .eq('device_id', this.deviceId)
                 .eq('status', 'pending')
+                .gt('timeout_at', 'now')
                 .select('*');
             if (!error) {
                 row = data?.[0] ?? null;
@@ -714,6 +1096,9 @@ export class RemoteChannel {
         }
 
         if (row) {
+            // The server writes the user's rollouts into every call row; a row
+            // without them (an older server) keeps what the device has.
+            rolloutManager.update(row.metadata?.rollouts);
             this.dispatchToolCall({ new: row, claimed: true });
             return;
         }
@@ -733,6 +1118,7 @@ export class RemoteChannel {
             .select('*')
             .eq('id', callId)
             .eq('device_id', this.deviceId)
+            .gt('timeout_at', 'now')
             .maybeSingle();
         if (error) {
             console.error(`[DEBUG] Doorbell row fetch failed for ${callId} after claim errors:`, error.message);
@@ -740,7 +1126,8 @@ export class RemoteChannel {
             return;
         }
         if (current?.status === 'pending') {
-            // No claim landed; device.ts claims it.
+            // No claim landed; device.ts claims it. Read-back already excludes
+            // expired rows using PostgreSQL time; its own claim does likewise.
             this.dispatchToolCall({ new: current });
         } else {
             // 'executing' reads the same whether our own claim committed with its
@@ -780,11 +1167,15 @@ export class RemoteChannel {
         }
 
         const state = this.channel.state;
+        this.realtimeHealth.observeSocketState(String((this.client as any)?.realtime?.connectionState?.() ?? 'unknown'));
 
         // Debug: Log current channel state (only if changed)
         if (!this.lastChannelState || this.lastChannelState !== state) {
             console.debug(`[DEBUG] channel state: ${state} — ${this.connState()}`);
             this.lastChannelState = state;
+            if (state !== 'joined' && state !== 'joining') {
+                captureRemote('remote_channel_state_health', { state, attempt: this.reconnectAttempt }).catch(() => {});
+            }
         }
 
         // 'joined' = healthy. Clear the joining-overstay timer.
@@ -803,12 +1194,25 @@ export class RemoteChannel {
                 }
             }
 
+            // Broadcast has outlived the incident's join->error cycle with a
+            // heartbeat confirmed after the join: the socket/channel path is
+            // working even if Presence is not. Stop charging this join to the
+            // reconnect budget, so a later ordinary blip gets fast recovery.
+            // Presence keeps its own cooldown; full readiness still needs it.
+            if (this.consecutiveUnreadyJoins > 0 && this.joinedAt !== null &&
+                this.lastHeartbeatOkAt !== null && this.lastHeartbeatOkAt > this.joinedAt &&
+                performance.now() - this.joinedAt >= STABLE_BROADCAST_RESET_MS) {
+                console.debug(`[DEBUG] Broadcast channel stable for ${Math.round((performance.now() - this.joinedAt) / 1000)}s — clearing reconnect backoff budget (presence ${this.presenceTracked ? 'ready' : 'still pending'})`);
+                this.consecutiveUnreadyJoins = 0;
+            }
+
             // Self-heal a failed presence publish: the channel is up, so nothing
             // else will ever retry (SUBSCRIBED won't fire again). Until it
             // lands the dashboard shows this device offline, and if track()
             // already failed its retries the capability is withdrawn too, so
             // the server fails every dispatch to it fast.
-            if (!this.presenceTracked && this.deviceId && !this.isTrackingPresence) {
+            if (!this.presenceTracked && this.deviceId && !this.isTrackingPresence &&
+                !this.presenceInCooldown()) {
                 console.debug('[DEBUG] Channel joined but presence not tracked — retrying track()');
                 this.trackPresenceWithRetry(0, 1).catch(() => { /* logged inside */ });
             }
@@ -834,7 +1238,6 @@ export class RemoteChannel {
 
         // Unhealthy: closed, errored, leaving — recreate
         this.joiningSince = null;
-        captureRemote('remote_channel_state_health', { state, attempt: this.reconnectAttempt });
         console.debug(`[DEBUG] ⚠️ Channel in unhealthy state '${state}' - recreating... — ${this.connState()}`);
         this.recreateChannel();
     }
@@ -862,8 +1265,9 @@ export class RemoteChannel {
             await this.sleep(SOCKET_SETTLE_MAX_MS);
             return;
         }
-        const deadline = Date.now() + SOCKET_SETTLE_MAX_MS;
-        while (realtime.isDisconnecting() && Date.now() < deadline) {
+        // Monotonic: Date.now may be patched by the clock-skew correction.
+        const deadline = performance.now() + SOCKET_SETTLE_MAX_MS;
+        while (realtime.isDisconnecting() && performance.now() < deadline) {
             await this.sleep(SOCKET_SETTLE_POLL_MS);
         }
     }
@@ -905,9 +1309,12 @@ export class RemoteChannel {
         console.log(`🔄 Recreating channel... (attempt ${this.reconnectAttempt}) — ${this.connState()}`);
 
         try {
-            // Jittered backoff so a fleet-wide event doesn't stampede every
-            // device into reconnecting at once. ~1-3s rising to ~15-45s.
-            const backoffMs = Math.min(30_000, 1000 * 2 ** Math.min(this.reconnectAttempt, 5)) * (0.5 + Math.random());
+            // Our force-recreate fallback shares the extended sustained-failure
+            // budget with the SDK. A 10s watchdog tick cannot cancel this wait
+            // because isRecreatingChannel guards its whole duration.
+            const backoffMs = watchdogRecreateDelayMs(
+                Math.max(this.reconnectAttempt, this.consecutiveUnreadyJoins)
+            );
             console.debug(`[DEBUG] Reconnect backoff: ${Math.round(backoffMs)}ms`);
             await this.sleep(backoffMs);
 
@@ -924,6 +1331,9 @@ export class RemoteChannel {
                 console.log(`✅ Channel self-healed during backoff — skipping recreate — ${this.connState()}`);
                 return; // finally-block below clears the re-entrancy guard
             }
+
+            // Count only watchdog recreations that continue past SDK self-heal.
+            this.realtimeHealth.record('watchdog_recreates');
 
             // Cap the whole recreate: a never-settling await (e.g. a subscribe that only
             // ever emits CLOSED) must not pin isRecreatingChannel=true and silently disable
@@ -972,8 +1382,9 @@ export class RemoteChannel {
                         'withdrawTransportCapability'
                     );
                 } catch (withdrawErr: any) {
-                    // The next failed recreate retries; the flag only advances
-                    // on a confirmed write, so nothing is lost.
+                    // The write stays queued, in order with any re-publish after
+                    // it, and ends within DEVICE_ROW_WRITE_TIMEOUT_MS; the flag
+                    // only advances on a confirmed write.
                     console.debug(`[DEBUG] Capability withdrawal did not complete: ${withdrawErr?.message}`);
                 }
             }
@@ -986,8 +1397,9 @@ export class RemoteChannel {
      * Claim a call. True only when THIS update flipped the row pending ->
      * executing, which is what makes dual delivery safe across processes.
      * .eq('status','pending') makes it conditional; .select('id') makes the
-     * result observable. On a transient DB error it returns true (execute
-     * anyway), matching prior behaviour — so device.ts's in-memory guard is what
+     * result observable. Expiry is checked using Postgres time, not the
+     * device clock. On a transient DB error it returns true (execute anyway),
+     * matching prior behaviour — so device.ts's in-memory guard is what
      * actually guarantees exactly-once within a process.
      */
     async markCallExecuting(callId: string): Promise<boolean> {
@@ -997,6 +1409,7 @@ export class RemoteChannel {
             .update({ status: 'executing' })
             .eq('id', callId)
             .eq('status', 'pending')
+            .gt('timeout_at', 'now')
             .select('id');
 
         if (error) {
@@ -1014,12 +1427,11 @@ export class RemoteChannel {
         return claimed;
     }
 
-    async updateCallResult(callId: string, status: string, result: any = null, errorMessage: string | null = null) {
+    async updateCallResult(callId: string, status: string, result: any = null, errorMessage: string | null = null): Promise<void> {
         if (!this.client) throw new Error('Client not initialized');
-        const updateData: any = {
-            status: status,
-            completed_at: new Date().toISOString()
-        };
+        // The DB terminal-status trigger stamps completed_at using PostgreSQL
+        // time. Do not send a device-generated timestamp.
+        const updateData: any = { status };
 
         // Strip NUL (U+0000) before it reaches the jsonb `result` column.
         // jsonb cannot store  and rejects the whole write (Postgres 22P05),
@@ -1069,9 +1481,17 @@ export class RemoteChannel {
         }
     }
 
-    /** Reachable means the private channel is joined. Gates the heartbeat and `status`. */
+    /**
+     * Reachable means all of it is true at once: the private channel is
+     * joined, this device has published its presence, and the local executor
+     * answers. The server needs the first two before it will dispatch, and a
+     * healthy channel on a device whose executor is dead is the false-online
+     * state issue #4 was opened for. Gates the heartbeat and `status`.
+     */
     private isReachable(): boolean {
-        return this.channel?.state === 'joined';
+        return this.channel?.state === 'joined'
+            && this.presenceTracked
+            && this.localExecutorProbe();
     }
 
     /**
@@ -1079,9 +1499,14 @@ export class RemoteChannel {
      * server filters on it), so it must not follow one channel's health — the
      * private channel's error path re-fires on every rejoin and would oscillate
      * the row against the heartbeat. Same predicate as the heartbeat gate.
+     *
+     * Every transition belongs here rather than calling setOnlineStatus(), which
+     * is the write and not the decision. Public so the device can route its
+     * recovery transition through the predicate too.
      */
-    private syncReachabilityStatus(): void {
-        this.queueStatusWrite(this.isReachable() ? 'online' : 'offline');
+    /** Resolves with whether the row actually took the write. */
+    syncReachabilityStatus(): Promise<boolean> {
+        return this.queueStatusWrite(this.isReachable() ? 'online' : 'offline');
     }
 
     /**
@@ -1093,17 +1518,22 @@ export class RemoteChannel {
      * Not the single writer: updateHeartbeat, registerDevice and setOffline's
      * subprocess write status directly, so this is not total ordering.
      */
-    private queueStatusWrite(status: 'online' | 'offline'): void {
+    private queueStatusWrite(status: 'online' | 'offline'): Promise<boolean> {
         // After teardown begins, setOffline() owns the final status write.
         if (this.shuttingDown) {
             console.debug(`[DEBUG] Status write '${status}' suppressed — teardown in progress`);
-            return;
+            return Promise.resolve(false);
         }
-        this.statusWriteChain = this.statusWriteChain
-            .then(() => (this.deviceId ? this.setOnlineStatus(this.deviceId, status) : undefined))
+        // The chain only sequences the writes; whether one landed goes back
+        // to whoever asked, so readiness can depend on it.
+        const write = this.statusWriteChain
+            .then(() => (this.deviceId ? this.setOnlineStatus(this.deviceId, status) : false))
             .catch((e: any) => {
                 console.error('[DEBUG] Status write failed:', e?.message);
+                return false;
             });
+        this.statusWriteChain = write.then(() => undefined);
+        return write;
     }
 
     /**
@@ -1141,7 +1571,7 @@ export class RemoteChannel {
 
             const { error } = await this.client
                 .from('mcp_devices')
-                .update({ last_seen: new Date().toISOString(), status: 'online' })
+                .update({ last_seen: 'now', status: 'online' })
                 .eq('id', deviceId);
 
             if (error) {
@@ -1159,6 +1589,8 @@ export class RemoteChannel {
     startHeartbeat(deviceId: string) {
         console.debug('[DEBUG] Starting heartbeat for device:', deviceId);
         this.heartbeatDeviceId = deviceId;
+        this.realtimeHealth.setDevice(deviceId);
+        this.realtimeHealth.start();
         this.connectionCheckInterval = setInterval(() => {
             this.checkConnectionHealth();
         }, 10000);
@@ -1230,8 +1662,9 @@ export class RemoteChannel {
         this.stopTokenRefresh();
     }
 
-    async setOnlineStatus(deviceId: string, status: 'online' | 'offline') {
-        if (!this.client) return;
+    /** @returns whether the row actually took the write. */
+    async setOnlineStatus(deviceId: string, status: 'online' | 'offline'): Promise<boolean> {
+        if (!this.client) return false;
 
         // Only log if status changed
         if (this.lastDeviceStatus !== status) {
@@ -1241,8 +1674,9 @@ export class RemoteChannel {
 
         const { error } = await this.client
             .from('mcp_devices')
-            .update({ status: status, last_seen: new Date().toISOString() })
-            .eq('id', deviceId);
+            .update({ status: status, last_seen: 'now' })
+            .eq('id', deviceId)
+            .abortSignal(this.deviceRowWriteSignal());
 
         if (error) {
             console.error(`[DEBUG] Failed to set status ${status}:`, error.message);
@@ -1250,10 +1684,12 @@ export class RemoteChannel {
                 console.error('Failed to update device status:', error.message);
             }
             await captureRemote('remote_channel_status_update_error', { error, status });
-            return;
+            return false;
         } else {
             console.debug(`[DEBUG] Device status set to ${status}`);
         }
+
+        return true;
 
         // console.log(status === 'online' ? `🔌 Device marked as ${status}` : `❌ Device marked as ${status}`);
     }
@@ -1312,7 +1748,9 @@ export class RemoteChannel {
             console.debug('[DEBUG] Spawning blocking update script:', scriptPath);
             console.debug('[DEBUG] Using node executable:', process.execPath);
 
-            const result = spawnSync('node', [
+            // The node running this device, by its full path: a bare 'node' is
+            // looked up in the working folder first on Windows
+            const result = spawnSync(process.execPath, [
                 scriptPath,
                 deviceId,
                 supabaseUrl,
@@ -1359,6 +1797,7 @@ export class RemoteChannel {
     }
 
     async unsubscribe() {
+        this.realtimeHealth.stop();
         // setOffline()'s durable write is the final word on `status` from here,
         // so stop the heartbeat and the channel callbacks from racing it. The
         // races that matter: a heartbeat tick firing as the signal arrives, and

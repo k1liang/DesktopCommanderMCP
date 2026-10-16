@@ -25,9 +25,11 @@ import { EditBlockArgsSchema } from "./schemas.js";
 import path from 'path';
 import { detectLineEnding, normalizeLineEndings } from '../utils/lineEndingHandler.js';
 import { configManager } from '../config-manager.js';
+import { DEFAULT_FILE_WRITE_LINE_LIMIT } from '../config-field-definitions.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
 import { resolveAbsolutePath } from '../handlers/filesystem-handlers.js';
+import type { EditResult } from '../utils/files/base.js';
 
 interface SearchReplace {
     search: string;
@@ -152,7 +154,7 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
     
     // Get the line limit from configuration
     const config = await configManager.getConfig();
-    const MAX_LINES = config.fileWriteLineLimit ?? 50; // Default to 50 if not set
+    const MAX_LINES = config.fileWriteLineLimit ?? DEFAULT_FILE_WRITE_LINE_LIMIT; // Fallback warning threshold
     
     // Detect file's line ending style
     const fileLineEnding = detectLineEnding(content);
@@ -165,9 +167,11 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
     let count = 0;
     let pos = tempContent.indexOf(normalizedSearch);
     
+    // Count the matches a replacement changes: they can't overlap, so the next
+    // search starts after this match (split/join below replaces the same ones)
     while (pos !== -1) {
         count++;
-        pos = tempContent.indexOf(normalizedSearch, pos + 1);
+        pos = tempContent.indexOf(normalizedSearch, pos + normalizedSearch.length);
     }
     
     // If exact match found and count matches expected replacements, proceed with exact replacement
@@ -195,9 +199,7 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
         
         if (maxLines > MAX_LINES) {
             const problemText = searchLines > replaceLines ? 'search text' : 'replacement text';
-            warningMessage = `\n\nWARNING: The ${problemText} has ${maxLines} lines (maximum: ${MAX_LINES}).
-            
-RECOMMENDATION: For large search/replace operations, consider breaking them into smaller chunks with fewer lines.`;
+            warningMessage = `\n\nNOTE: The ${problemText} has ${maxLines} lines (warning threshold: ${MAX_LINES}); the edit completed. Large payloads may take longer to transfer.`;
         }
         
         await writeFile(filePath, newContent);
@@ -397,6 +399,11 @@ function highlightDifferences(expected: string, actual: string): string {
     return `${commonPrefix}{-${expectedDiff}-}{+${actualDiff}+}${commonSuffix}`;
 }
 
+/** Why a file handler's edit failed, as edit_block reports it */
+function editFailure(result: EditResult): string {
+    return result.errors?.map(e => e.error).join('; ') || 'Unknown error';
+}
+
 /**
  * Handle edit_block command
  *
@@ -447,7 +454,10 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
         if (hasEditRange) {
             try {
                 // parsed.range is guaranteed non-empty string by hasRange check above
-                await handler.editRange!(validatedPath!, parsed.range!, content, parsed.options);
+                const result = await handler.editRange!(validatedPath!, parsed.range!, content, parsed.options);
+                if (!result.success) {
+                    return createErrorResponse(editFailure(result));
+                }
                 const resolvedRangePath = resolveAbsolutePath(parsed.file_path);
                 return {
                     content: [{
@@ -506,8 +516,7 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
                 };
             }
 
-            const errorMsg = result.errors?.map(e => e.error).join('; ') || 'Unknown error';
-            return createErrorResponse(errorMsg);
+            return createErrorResponse(editFailure(result));
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             return createErrorResponse(errorMessage);

@@ -1,13 +1,20 @@
 #!/usr/bin/env node
 
-import { RemoteChannel, observeServerDate, type AuthSession } from './remote-channel.js';
+import { ChannelUnreachableError, RemoteChannel, observeServerDate, type AuthSession } from './remote-channel.js';
 import { DeviceAuthenticator } from './device-authenticator.js';
 import { DesktopCommanderIntegration } from './desktop-commander-integration.js';
 import { fileURLToPath } from 'url';
 import os from 'os';
 import fs from 'fs/promises';
 import path from 'path';
+import lockfile from 'proper-lockfile';
 import { captureRemote } from '../utils/capture.js';
+import { writeFileAtomic } from '../utils/atomic-write.js';
+import { exitProcess } from '../utils/exit-process.js';
+import { observeTransport } from './transport-telemetry.js';
+import { startTerminalTimestamps } from '../utils/terminal-timestamps.js';
+import { VERSION } from '../version.js';
+import { rolloutManager } from './rollouts.js';
 
 export interface MCPDeviceOptions {
     persistSession?: boolean;
@@ -23,9 +30,48 @@ export interface MCPDeviceOptions {
 const SEEN_CALL_IDS_MAX = 100;
 const PERSISTED_DEVICE_LOOKUP_ATTEMPTS = 3;
 const PERSISTED_DEVICE_LOOKUP_RETRY_MS = 250;
+/**
+ * Floor between recovery attempts. ensureReady()'s own backoff covers a child
+ * that fails to start; this covers one that starts and then fails verification,
+ * where no restart backoff was armed and the loop would otherwise spin.
+ */
+const RECOVERY_MIN_DELAY_MS = 1000;
 
 export function getRemoteDeviceConfigPath() {
     return path.join(os.homedir(), '.desktop-commander-device', 'device.json');
+}
+
+/**
+ * Cross-process lock on device.json. A device's save holds it from its check
+ * that the file is still there to its write, and `remote --logout` holds it to
+ * remove the file, so a logout cannot land between the two and be written
+ * over. Settings as for the server's config.json lock (config-manager.ts).
+ */
+function lockRemoteDeviceConfig(configPath: string): Promise<() => Promise<void>> {
+    return lockfile.lock(configPath, {
+        realpath: false,
+        stale: 30_000,
+        update: 10_000,
+        retries: { retries: 100, factor: 1.2, minTimeout: 10, maxTimeout: 100 },
+        // The default throws from a timer, which ends the process
+        onCompromised: (error) => console.error(`The device.json lock was lost while held: ${error.message}`),
+    });
+}
+
+/** `remote --logout`: removes device.json, under the lock a running device's save takes. */
+export async function removeRemoteDeviceConfig(configPath = getRemoteDeviceConfigPath()): Promise<void> {
+    let release: (() => Promise<void>) | undefined;
+    try {
+        release = await lockRemoteDeviceConfig(configPath);
+    } catch (error: any) {
+        // No config folder: nothing was saved
+        if (error.code !== 'ENOENT') throw error;
+    }
+    try {
+        await fs.rm(configPath, { force: true });
+    } finally {
+        await release?.();
+    }
 }
 
 export class MCPDevice {
@@ -43,6 +89,14 @@ export class MCPDevice {
      * whatever is still in flight.
      */
     private configWriteChain: Promise<void> = Promise.resolve();
+    /**
+     * device.json's text when this run last loaded or saved it. From then on, a
+     * file that is gone or holds other text was removed (`remote --logout`) or
+     * replaced (a login after it) by someone else.
+     */
+    private configTextOnDisk?: string;
+    /** device.json was removed or replaced after this run loaded or saved it: nothing is saved again this run. */
+    private loggedOutLocally = false;
     /** Call ids already handled by THIS process (insertion-ordered, bounded). */
     private seenCallIds: Set<string> = new Set();
 
@@ -67,6 +121,11 @@ export class MCPDevice {
         // Initialize desktop integration
         this.desktop = new DesktopCommanderIntegration();
 
+        // Readiness is a claim about executing, so it has to consult the local
+        // executor too. Read through a probe rather than a cached flag: there
+        // is then no state to keep in step, and `desktop` can be replaced.
+        this.remoteChannel.setLocalExecutorProbe(() => this.desktop.ready);
+
         // Graceful shutdown handlers (only set once)
         this.setupShutdownHandlers();
     }
@@ -76,7 +135,7 @@ export class MCPDevice {
             if (this.isShuttingDown) {
                 console.log(`\n${signal} received, but already shutting down...`);
                 // Force exit if we get multiple signals
-                process.exit(1);
+                exitProcess(1);
                 return;
             }
 
@@ -85,17 +144,17 @@ export class MCPDevice {
             // Force exit after 5 seconds if graceful shutdown hangs
             const forceExit = setTimeout(() => {
                 console.error('\n⚠️ Graceful shutdown timed out, forcing exit...');
-                process.exit(1);
+                exitProcess(1);
             }, 5000);
 
             try {
                 await this.shutdown();
                 clearTimeout(forceExit);
-                process.exit(0);
+                exitProcess(0);
             } catch (error) {
                 console.error('Error during shutdown:', error);
                 await captureRemote('remote_device_shutdown_handler_error', { error });
-                process.exit(1);
+                exitProcess(1);
             }
         };
 
@@ -108,7 +167,7 @@ export class MCPDevice {
             handleShutdown('SIGINT').catch((error) => {
                 console.error('Fatal error during shutdown:', error);
                 captureRemote('remote_device_shutdown_handler_error', { error, signal: 'SIGINT' }).catch(() => { });
-                process.exit(1);
+                exitProcess(1);
             });
         });
 
@@ -116,7 +175,7 @@ export class MCPDevice {
             handleShutdown('SIGTERM').catch((error) => {
                 console.error('Fatal error during shutdown:', error);
                 captureRemote('remote_device_shutdown_handler_error', { error, signal: 'SIGTERM' }).catch(() => { });
-                process.exit(1);
+                exitProcess(1);
             });
         });
     }
@@ -143,6 +202,11 @@ export class MCPDevice {
             // Load persisted configuration (deviceId, session)
             let session = await this.loadPersistedConfig();
 
+            await captureRemote('remote_device_session_state', {
+                has_persisted_session: Boolean(session),
+                has_persisted_device_id: Boolean(this.deviceId),
+            });
+
             // 2. Set Session or Authenticate
             if (session) {
                 const { error } = await this.remoteChannel.setSession(session);
@@ -152,7 +216,6 @@ export class MCPDevice {
                     session = null;
                 } else {
                     console.log('   - ✅ Session restored');
-                    console.log('   - ℹ️  To log out locally: npx @wonderwhy-er/desktop-commander@latest remote --logout');
 
                     // Revoking a device removes its server-side mcp_devices row, but the
                     // local config can still hold a valid user session + the now-deleted
@@ -171,6 +234,7 @@ export class MCPDevice {
             }
 
             if (!session) {
+                await captureRemote('remote_device_auth_flow_started');
                 console.log('\n🔐 Authenticating with Remote MCP server...');
                 const authenticator = new DeviceAuthenticator(this.baseServerUrl);
                 session = await authenticator.authenticate(this.deviceId);
@@ -202,20 +266,73 @@ export class MCPDevice {
             // Force save the current session immediately to ensure it's persisted
             await this.savePersistedConfig();
 
+            // Which rollouts are on for this user, known before it registers:
+            // asked now and again every 30 minutes, each time with the
+            // session's current token. setSession() may have refreshed the one
+            // device.json held, and the session keeps refreshing while it runs.
+            await rolloutManager.load(this.baseServerUrl, () => this.remoteChannel.getAccessToken());
+            rolloutManager.startRefresh();
+
             const deviceName = os.hostname();
 
-            // Register as device
-            await this.remoteChannel.registerDevice(
-                await this.desktop.listClientTools(),
-                this.deviceId,
-                deviceName,
-                (payload: any) => this.handleNewToolCall(payload)
-            );
+            // Register as device. registerDevice() resolves only once the
+            // realtime channel is joined and presence is published, which is
+            // exactly what the hosted service needs to deliver a call — so a
+            // rejection means "running, but nothing can reach this device", and
+            // that has to be said instead of "Device ready".
+            //
+            // Deliberately not fatal, and deliberately not rethrown into the
+            // outer catch, which exits the process: the socket watchdog keeps
+            // retrying and announces "✅ Channel subscribed" when it gets
+            // through, so quitting here would remove the only way back.
+            let reachable = true;
+            try {
+                await this.remoteChannel.registerDevice(
+                    await this.desktop.listClientTools(),
+                    this.deviceId,
+                    deviceName,
+                    (payload: any) => this.handleNewToolCall(payload)
+                );
+            } catch (error: any) {
+                // Only a channel fault is recoverable here. A failed lookup or a
+                // missing device row happens before registerDevice() stores the
+                // recreation parameters, and both checkConnectionHealth() and
+                // recreateChannel() return early without them — so nothing in
+                // this process could repair it, and swallowing it would promise
+                // a retry that can never happen. Those stay fatal, as before.
+                if (!(error instanceof ChannelUnreachableError)) throw error;
+                reachable = false;
+                console.error(`   - ❌ Realtime channel is not open: ${error.message}`);
+                await captureRemote('remote_device_registered_unreachable', { error });
+            }
 
-            console.log('✅ Device ready:');
+            console.log(reachable
+                ? '✅ Device ready:'
+                : '⚠️  Device registered, but NOT reachable — no command can arrive yet:');
             console.log(`   - User:         ${this.remoteChannel.user!.email}`);
             console.log(`   - Device ID:    ${this.deviceId}`);
             console.log(`   - Device Name:  ${deviceName}`);
+            console.log(`   - Version:      ${VERSION}`);
+            if (!reachable) {
+                console.log('   - Retrying in the background; commands start working once you see "✅ Channel subscribed".');
+            } else {
+                console.log('');
+                console.log('✅ Desktop Commander Remote is connected');
+                console.log('');
+                console.log(`   Device: ${deviceName}`);
+                console.log('   Status: Online');
+                console.log('');
+                console.log('┌─ Next');
+                console.log('│ Return to ChatGPT or Claude and continue your conversation.');
+                console.log('│ Keep this Terminal running. You can minimize it.');
+                console.log('└─ Press Ctrl+C to disconnect.');
+                console.log('');
+                console.log('┌─ Commands');
+                console.log('│ Help:    npx @wonderwhy-er/desktop-commander@latest remote --help');
+                console.log('│ Log out: npx @wonderwhy-er/desktop-commander@latest remote --logout');
+                console.log('└─ Run these in a new Terminal, or after disconnecting.');
+                console.log('');
+            }
 
             // Keep process alive
             this.remoteChannel.startHeartbeat(this.deviceId!);
@@ -227,7 +344,7 @@ export class MCPDevice {
             }
             await captureRemote('remote_device_startup_failed', { error });
             await this.shutdown();
-            process.exit(1);
+            exitProcess(1);
         }
     }
 
@@ -252,10 +369,20 @@ export class MCPDevice {
         try {
             console.debug('[DEBUG] Loading persisted config from:', this.configPath);
             const data = await fs.readFile(this.configPath, 'utf8');
+            // A logout from here on, before this run's first save, removes it
+            this.configTextOnDisk = data;
             const config = JSON.parse(data);
 
             this.deviceId = config?.deviceId;
             console.debug('[DEBUG] Loaded device ID:', this.deviceId);
+
+            // A session without its device id is not a login: restoring it
+            // skips the revoked-device check below, and registration then fails
+            // with "Device not found: undefined" on every start. Authorize again.
+            if (config.session && this.persistSession && !this.deviceId) {
+                console.debug('[DEBUG] Ignoring persisted session without a device ID');
+                return null;
+            }
 
             if (config.session && this.persistSession) {
                 console.log('💾 Found persisted session for device ' + this.deviceId);
@@ -287,7 +414,19 @@ export class MCPDevice {
         }
     }
 
+    /** device.json's text, or undefined when there is none. Errors other than "not found" go to the caller, which logs them. */
+    private async readConfigText(): Promise<string | undefined> {
+        try {
+            return await fs.readFile(this.configPath, 'utf8');
+        } catch (error: any) {
+            if (error.code === 'ENOENT') return undefined;
+            throw error;
+        }
+    }
+
     async clearPersistedConfig() {
+        // Removed by this run itself, not by a logout
+        this.configTextOnDisk = undefined;
         try {
             await fs.rm(this.configPath, { force: true });
             console.debug('[DEBUG] Cleared stale persisted config:', this.configPath);
@@ -308,6 +447,7 @@ export class MCPDevice {
 
     private async writePersistedConfig(rotated?: AuthSession): Promise<void> {
         try {
+            if (this.loggedOutLocally) return;
             console.debug('[DEBUG] Saving persisted config, persistSession:', this.persistSession);
             // Prefer the session TOKEN_REFRESHED handed us over re-reading it. A
             // sign-out landing in that gap answers null, and the write below would
@@ -333,17 +473,36 @@ export class MCPDevice {
             // Ensure the config directory exists
             console.debug('[DEBUG] Creating config directory:', path.dirname(this.configPath));
             await fs.mkdir(path.dirname(this.configPath), { recursive: true });
-            // Write then rename: the rename is the commit boundary, so a write
-            // cut short leaves the previous complete session rather than a
-            // truncated file. loadPersistedConfig() answers a JSON.parse
-            // failure with null, which costs a full browser reauthorization.
-            // Same shape as ConfigManager's atomic save; the pid keeps two
-            // processes off each other's temp file, and configWriteChain keeps
-            // this one off its own.
-            const tempPath = `${this.configPath}.${process.pid}.tmp`;
-            await fs.writeFile(tempPath, JSON.stringify(config, null, 2), { mode: 0o600 });
-            await fs.rename(tempPath, this.configPath);
-            console.debug('[DEBUG] Config saved to:', this.configPath);
+            // From the check to the write, `remote --logout` waits for this lock
+            const release = await lockRemoteDeviceConfig(this.configPath);
+            try {
+                // `remote --logout` removes device.json from another process, and
+                // the docs say that removes the saved credentials. Writing them back
+                // at the next rotation or at shutdown would undo it: this run keeps
+                // its session in memory (the logout is local only) and saves nothing.
+                // A login after the logout saves its own device.json, which this
+                // run's credentials must not replace either.
+                if (this.configTextOnDisk !== undefined) {
+                    const onDisk = await this.readConfigText();
+                    if (onDisk !== this.configTextOnDisk) {
+                        this.loggedOutLocally = true;
+                        console.log(onDisk === undefined
+                            ? '🔓 Saved Remote MCP device credentials were removed (remote --logout): this run keeps its session in memory and won\'t save it again'
+                            : '🔓 Saved Remote MCP device credentials were replaced (a login after remote --logout): this run keeps its session in memory and won\'t save it again');
+                        return;
+                    }
+                }
+                // Atomic write: a save cut short leaves the previous complete
+                // session rather than a truncated file. loadPersistedConfig()
+                // answers a JSON.parse failure with null, which costs a full
+                // browser reauthorization.
+                const text = JSON.stringify(config, null, 2);
+                await writeFileAtomic(this.configPath, text, { mode: 0o600 });
+                this.configTextOnDisk = text;
+                console.debug('[DEBUG] Config saved to:', this.configPath);
+            } finally {
+                await release().catch((error) => console.error(' - ❌ Failed to release the device.json lock:', error.message));
+            }
         } catch (error: any) {
             console.error(' - ❌ Failed to save config:', error.message);
             console.debug('[DEBUG] Config save error details:', error);
@@ -383,23 +542,47 @@ export class MCPDevice {
      * connected" until someone restarted the process by hand.
      */
     private async handleLocalMcpLoss(reason: string) {
-        if (this.deviceId) {
-            await this.remoteChannel.setOnlineStatus(this.deviceId, 'offline')
-                .catch((e: any) => console.error('Failed to mark device offline:', e.message));
-        }
+        // Through the predicate and its queue, not a direct write: the probe
+        // already reads false by the time this runs, and a direct write can be
+        // overtaken by an 'online' still sitting in the queue — which would put
+        // a device with a dead executor back into the server's selection pool.
+        await this.remoteChannel.syncReachabilityStatus()
+            .catch((e: any) => console.error('Failed to mark device offline:', e.message));
 
-        // Recover proactively rather than waiting for the next tool call to
-        // trigger the lazy restart: we just went offline, so no further calls
-        // would be routed here and that wait would never end.
-        try {
-            await this.desktop.ensureReady();
-            if (this.deviceId) {
-                await this.remoteChannel.setOnlineStatus(this.deviceId, 'online');
+        // Keep trying, rather than attempting once. The lazy restart in
+        // ensureReady() fires on an incoming tool call, and this device is now
+        // offline — the hosted service answers a call for an offline device
+        // with "No devices available" (confirmed live on 0.2.50), so no call
+        // will ever arrive to trigger it. One failed attempt used to mean the
+        // device stayed dead until a human restarted the connector.
+        let reported = false;
+        while (!this.isShuttingDown) {
+            try {
+                // ensureReady() only reports success once the child has served a
+                // request, so reaching here is proof of execution, not just of a
+                // completed handshake.
+                await this.desktop.ensureReady();
+                // Not setOnlineStatus('online'): the executor recovering says
+                // nothing about the channel. Let the predicate decide, or this
+                // repeats the one-sided claim this whole change removes.
+                this.remoteChannel.syncReachabilityStatus();
+                console.log('♻️  Local Desktop Commander MCP restarted; device is online again');
+                return;
+            } catch (error: any) {
+                console.error(`❌ Could not restart local Desktop Commander MCP: ${error.message}`);
+                // Once per outage, not once per attempt: a device that never
+                // recovers would otherwise emit this every backoff window for
+                // as long as it runs.
+                if (!reported) {
+                    reported = true;
+                    await captureRemote('remote_device_local_mcp_restart_failed', { error, reason });
+                }
+                // ensureReady() refuses inside its backoff window; wait it out.
+                // The floor covers a child that starts but fails verification,
+                // where no restart backoff was armed.
+                const waitMs = Math.max(this.desktop.msUntilRestartAllowed, RECOVERY_MIN_DELAY_MS);
+                await new Promise((resolve) => setTimeout(resolve, waitMs));
             }
-            console.log('♻️  Local Desktop Commander MCP restarted; device is online again');
-        } catch (error: any) {
-            console.error(`❌ Could not restart local Desktop Commander MCP: ${error.message}`);
-            await captureRemote('remote_device_local_mcp_restart_failed', { error, reason });
         }
     }
 
@@ -426,6 +609,11 @@ export class MCPDevice {
             return;
         }
 
+        const observation = { callId: call_id, deviceId: this.deviceId, toolName: tool_name };
+
+        // Count every targeted delivery, including duplicates, before the local claim.
+        observeTransport({ stage: 'device_call_received', ...observation });
+        
         console.log(`🔧 Received tool call ${call_id}: ${tool_name} ${JSON.stringify(tool_args)} metadata: ${JSON.stringify(metadata)}`);
 
         // LOCAL claim first — this is the authoritative guard against executing
@@ -440,6 +628,9 @@ export class MCPDevice {
         }
         this.rememberCallId(call_id);
 
+        // Running the tool and saving its result fail separately: only a tool
+        // that didn't run is "tool_call_failed"
+        let result;
         try {
             // DB claim second — keeps the row state machine honest, gives
             // cross-restart/cross-process protection, and is observable. It may
@@ -451,8 +642,6 @@ export class MCPDevice {
                 // markCallExecuting already logged the duplicate-delivery skip.
                 return;
             }
-
-            let result;
 
             // Handle 'ping' tool specially
             if (tool_name === 'ping') {
@@ -474,29 +663,45 @@ export class MCPDevice {
                 setTimeout(async () => {
                     console.log('🛑 Remote shutdown requested. Exiting...');
                     await this.shutdown();
-                    process.exit(0);
+                    exitProcess(0);
                 }, 1000);
             } else {
                 // Execute other tools using desktop integration
                 result = await this.desktop.callClientTool(tool_name, tool_args, metadata);
             }
-
-            console.log(`✅ Tool call ${tool_name} completed:\r\n ${JSON.stringify(result)}`);
-
-            // The result write itself notifies the server (a DB trigger).
-            await this.remoteChannel.updateCallResult(call_id, 'completed', result);
-
         } catch (error: any) {
             console.error(`❌ Tool call ${tool_name} failed:`, error.message);
-            // The failure path must not fail: this method's promise is discarded
-            // at every call site, so a throw here becomes an unhandled rejection
-            // and takes the device process down.
+            observeTransport({ stage: 'tool_call_failed', ...observation });
+            await this.reportToolCallFailure(call_id, tool_name, error);
+            return;
+        }
+
+        console.log(`✅ Tool call ${tool_name} completed:\r\n ${JSON.stringify(result)}`);
+
+        // The tool ran. A result that can't be saved is reported and written as
+        // failed, as before, but its telemetry stays "tool_call_completed"
+        try {
             try {
-                await captureRemote('remote_device_tool_call_failed', { error, tool_name });
-                await this.remoteChannel.updateCallResult(call_id, 'failed', null, error.message);
-            } catch (reportError: any) {
-                console.error(`❌ Could not report failure for ${call_id}:`, reportError?.message);
+                await this.remoteChannel.updateCallResult(call_id, 'completed', result);
+            } finally {
+                observeTransport({ stage: 'tool_call_completed', ...observation});
             }
+        } catch (error: any) {
+            console.error(`❌ Tool call ${tool_name} failed:`, error.message);
+            await this.reportToolCallFailure(call_id, tool_name, error);
+        }
+    }
+
+    /** Reports a tool call that failed, or whose result couldn't be saved, and writes its "failed" row. */
+    private async reportToolCallFailure(call_id: string, tool_name: string, error: any) {
+        // The failure path must not fail: handleNewToolCall's promise is discarded
+        // at every call site, so a throw here becomes an unhandled rejection
+        // and takes the device process down.
+        try {
+            await captureRemote('remote_device_tool_call_failed', { error, tool_name });
+            await this.remoteChannel.updateCallResult(call_id, 'failed', null, error.message);
+        } catch (reportError: any) {
+            console.error(`❌ Could not report failure for ${call_id}:`, reportError?.message);
         }
     }
 
@@ -516,6 +721,7 @@ export class MCPDevice {
             console.debug('[DEBUG] Calling stopHeartbeat()');
             this.remoteChannel.stopHeartbeat();
             console.log('  ✓ Heartbeat stopped');
+            rolloutManager.stopRefresh();
 
             // Unsubscribe from channel
             console.log('  → Unsubscribing from channel...');
@@ -560,6 +766,7 @@ const isMainModule = process.argv[1] && (
 );
 
 if (isMainModule) {
+    startTerminalTimestamps();
     // Parse command-line arguments
     const args = process.argv.slice(2);
     const options = {
