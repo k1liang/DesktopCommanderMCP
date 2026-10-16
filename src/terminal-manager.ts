@@ -68,6 +68,7 @@ interface CompletedSession {
   exitCode: number | null;
   signal: NodeJS.Signals | null;  // The signal that ended it; then exitCode is null
   endTime: Date;
+  fullyReadTime?: Date;           // Unread/paginating completed sessions are protected from soft eviction
 }
 
 /** The retained-output fields shared by active and completed sessions. */
@@ -125,6 +126,8 @@ export interface ProcessStartResult extends CommandExecutionResult {
 export const MAX_BUFFERED_OUTPUT_CHARS = 50 * 1024 * 1024;  // per session; oldest lines evicted first
 const MAX_LINE_CHARS = 1024 * 1024;                  // force-split longer lines so eviction can work
 const MAX_WAIT_OUTPUT_CHARS = 2 * 1024 * 1024;       // start_process wait buffer (the initial output it returns)
+const MAX_COMPLETED_SESSIONS = 2048;                 // global hard cap across all ChatGPT sessions
+const MAX_COMPLETED_BUFFERED_CHARS = 256 * 1024 * 1024; // global hard memory cap for completed output
 
 // Result type for paginated output reading
 export interface PaginatedOutputResult {
@@ -145,6 +148,60 @@ export class TerminalManager {
   private completedSessions: Map<number, CompletedSession> = new Map();
   private deliveryTurn = 0;
   private deliveryTurnOpen = false;
+
+  private archiveCompletedSession(
+    pid: number,
+    session: ManagedSession,
+    exitCode: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    const previous = this.completedSessions.get(pid);
+    this.completedSessions.delete(pid);
+    this.completedSessions.set(pid, {
+      session,
+      exitCode,
+      signal,
+      endTime: new Date(),
+      fullyReadTime: previous?.fullyReadTime,
+    });
+    this.sessions.delete(pid);
+    this.trimCompletedSessions();
+  }
+
+  private trimCompletedSessions(): void {
+    let totalBufferedChars = 0;
+    for (const completed of this.completedSessions.values()) {
+      totalBufferedChars += completed.session.bufferedChars;
+    }
+
+    while (
+      this.completedSessions.size > MAX_COMPLETED_SESSIONS ||
+      totalBufferedChars > MAX_COMPLETED_BUFFERED_CHARS
+    ) {
+      let victimPid: number | undefined;
+      let victim: CompletedSession | undefined;
+
+      // Prefer sessions whose retained output has already been fully read.
+      for (const [pid, completed] of this.completedSessions) {
+        if (completed.fullyReadTime) {
+          victimPid = pid;
+          victim = completed;
+          break;
+        }
+      }
+
+      // If every completed process is still unread/paginating, enforce the hard
+      // resource limit by evicting the oldest one rather than growing without bound.
+      if (victimPid === undefined) {
+        const oldest = this.completedSessions.entries().next().value as [number, CompletedSession] | undefined;
+        if (!oldest) break;
+        [victimPid, victim] = oldest;
+      }
+
+      totalBufferedChars -= victim?.session.bufferedChars ?? 0;
+      this.completedSessions.delete(victimPid);
+    }
+  }
 
   /**
    * Send input to a running process
@@ -278,6 +335,8 @@ export class TerminalManager {
       streams: newStreamTails()
     };
 
+    // PID reuse must not leave an old completed-session record shadowing the new process.
+    this.completedSessions.delete(childProcess.pid);
     this.sessions.set(childProcess.pid, session);
 
     // Timing telemetry
@@ -336,7 +395,12 @@ export class TerminalManager {
       // terminable, and its 'exit' records the completion as usual.
       forwardProcessError = (err: Error) => {
         if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
-          this.sessions.delete(childProcess.pid!);
+          this.archiveCompletedSession(
+            childProcess.pid!,
+            session,
+            childProcess.exitCode,
+            childProcess.signalCode,
+          );
         }
         exitReason = 'process_exit';
         resolveOnce({
@@ -449,21 +513,7 @@ export class TerminalManager {
 
       childProcess.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
         if (childProcess.pid) {
-          // Store completed session before removing active session
-          this.completedSessions.set(childProcess.pid, {
-            session,
-            exitCode: code,
-            signal,
-            endTime: new Date()
-          });
-
-          // Keep only last 100 completed sessions
-          if (this.completedSessions.size > 100) {
-            const oldestKey = Array.from(this.completedSessions.keys())[0];
-            this.completedSessions.delete(oldestKey);
-          }
-
-          this.sessions.delete(childProcess.pid);
+          this.archiveCompletedSession(childProcess.pid, session, code, signal);
         }
         exitReason = 'process_exit';
         resolveOnce({
@@ -492,6 +542,7 @@ export class TerminalManager {
    */
   private recordOutput(session: ManagedSession, stream: OutputStream, text: string): void {
     this.appendToLineBuffer(session, text);
+    if (this.completedSessions.has(session.pid)) this.trimCompletedSessions();
     const tail = session.streams[stream];
     tail.text = (text.length >= STATE_DETECTION_TAIL_CHARS ? text : tail.text + text).slice(-STATE_DETECTION_TAIL_CHARS);
     tail.chars += text.length;
@@ -610,6 +661,14 @@ export class TerminalManager {
       );
       result.evictedLines = completedSession.session.evictedLines;
       result.signal = completedSession.signal;
+      if (
+        offset === 0 &&
+        result.remaining === 0 &&
+        (completedSession.session.process.stdout?.readableEnded ?? true) &&
+        (completedSession.session.process.stderr?.readableEnded ?? true)
+      ) {
+        completedSession.fullyReadTime ??= new Date();
+      }
       return result;
     }
 
