@@ -91,6 +91,10 @@ class ProxyDiagnostics {
   private previousMessageSeq: bigint | null = null;
   private previousMessageMethod: string | null = null;
   private previousMessageTool: string | null = null;
+  private lastCompletedToolAt: number | null = null;
+  private lastCompletedToolSeq: bigint | null = null;
+  private lastCompletedToolName: string | null = null;
+  private lastCompletedToolDurationMs: number | null = null;
   private lastStallSeq: bigint | null = null;
 
   constructor(options: ResilientMcpProxyOptions) {
@@ -120,18 +124,24 @@ class ProxyDiagnostics {
     const method = String(message?.method ?? 'unknown');
     const tool = method === 'tools/call' ? String(message?.params?.name ?? 'unknown') : null;
 
-    if (sincePreviousMessageMs !== null && sincePreviousMessageMs >= this.messageGapThresholdMs) {
+    const idleAfterCompletedToolMs = this.lastCompletedToolAt === null ? null : now - this.lastCompletedToolAt;
+    if (idleAfterCompletedToolMs !== null && idleAfterCompletedToolMs >= this.messageGapThresholdMs) {
       const previousStallSeq = this.lastStallSeq;
       const messagesSincePreviousStall = previousStallSeq === null ? null : this.sequence - previousStallSeq;
+      this.lastStallSeq = this.sequence;
       this.appendStallEvent({
         kind: 'continuation_gap_candidate',
         time: new Date(now).toISOString(),
         previous_seq: previousSeq?.toString() ?? null,
         seq: this.sequence.toString(),
-        gap_ms: sincePreviousMessageMs,
+        arrival_gap_ms: sincePreviousMessageMs,
+        idle_after_completed_tool_ms: idleAfterCompletedToolMs,
         threshold_ms: this.messageGapThresholdMs,
         previous_method: previousMethod,
         previous_tool: previousTool,
+        last_completed_tool_seq: this.lastCompletedToolSeq?.toString() ?? null,
+        last_completed_tool: this.lastCompletedToolName,
+        last_completed_tool_duration_ms: this.lastCompletedToolDurationMs,
         method,
         tool,
         process_message_index: this.processIndex,
@@ -165,6 +175,12 @@ class ProxyDiagnostics {
     generation: number;
   }): void {
     const { stamp } = meta;
+    const completedAt = Date.now();
+    this.lastCompletedToolAt = completedAt;
+    this.lastCompletedToolSeq = stamp.seq;
+    this.lastCompletedToolName = meta.toolName;
+    this.lastCompletedToolDurationMs = meta.durationMs;
+
     process.stderr.write(
       `[resilient-mcp-proxy] INFO tools/call seq=${stamp.seq} tool=${meta.toolName} duration_ms=${meta.durationMs} ` +
       `outcome=${meta.outcome} response_bytes=${meta.responseBytes} paged=${meta.paged} active=${meta.active} ` +

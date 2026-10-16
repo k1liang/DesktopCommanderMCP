@@ -177,7 +177,11 @@ async function run() {
       .map(line => JSON.parse(line));
     const firstToolStalls = firstEvents.filter(event => event.kind === 'tool_stall');
     assert.ok(firstToolStalls.length > 0, 'tool calls should be captured in the dedicated stall log');
-    assert.ok(firstEvents.some(event => event.kind === 'continuation_gap_candidate'), 'continuation gaps should be captured in the dedicated stall log');
+    const continuationGap = firstEvents.find(event => event.kind === 'continuation_gap_candidate');
+    assert.ok(continuationGap, 'continuation gaps should be captured in the dedicated stall log');
+    assert.equal(typeof continuationGap.arrival_gap_ms, 'number');
+    assert.equal(typeof continuationGap.idle_after_completed_tool_ms, 'number');
+    assert.ok(continuationGap.last_completed_tool_seq, 'continuation gaps should identify the last completed tool');
     assert.ok(firstEvents.some(event => event.kind === 'search_session_rehydrated'), 'child replacement should record search rehydration');
     for (let i = 1; i < firstToolStalls.length; i += 1) {
       assert.ok(BigInt(firstToolStalls[i].seq) > BigInt(firstToolStalls[i - 1].seq), 'tool message sequence must increase');
