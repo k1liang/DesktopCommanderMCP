@@ -13,6 +13,20 @@ function event(time, workflow, suffix) {
   };
 }
 
+function lifecycleEvent(time, message, workflow, suffix, extra = {}) {
+  return {
+    time,
+    message,
+    attrs: {
+      cmd_request_id: `${workflow}/${suffix}`,
+      request_id: `cmd_${workflow}_${suffix}`,
+      channel: 'main',
+      rpc_method: 'tools/call',
+      ...extra,
+    },
+  };
+}
+
 async function runTests() {
   const emitted = [];
   const tracker = new WorkflowStallTracker({
@@ -75,7 +89,65 @@ async function runTests() {
   assert.equal(recovered.other_commands_during_gap, 2);
   assert.equal(recovered.other_workflows_during_gap, 1);
 
-  console.log('PASS: workflow stall tracker records open and recovered per-workflow gaps');
+  const precise = [];
+  const lifecycle = [];
+  const preciseTracker = new WorkflowStallTracker({
+    stallMs: 10_000,
+    appendEvent: value => precise.push(value),
+    appendLifecycleEvent: value => lifecycle.push(value),
+  });
+  const p0 = t0 + 30_000;
+  preciseTracker.observe({
+    logs: { events: [
+      event(new Date(p0).toISOString(), workflowA, 'p1'),
+      event(new Date(p0 + 1_000).toISOString(), workflowB, 'pb1'),
+    ] },
+    health,
+    now: p0 + 2_000,
+  });
+  preciseTracker.observe({
+    logs: { events: [
+      event(new Date(p0).toISOString(), workflowA, 'p1'),
+      event(new Date(p0 + 1_000).toISOString(), workflowB, 'pb1'),
+      lifecycleEvent(new Date(p0 + 2_000).toISOString(), 'dispatcher received terminal response from MCP server', workflowA, 'p1', { status_code: 200 }),
+      lifecycleEvent(new Date(p0 + 2_100).toISOString(), 'dispatcher posting terminal response to control plane', workflowA, 'p1'),
+      lifecycleEvent(new Date(p0 + 2_200).toISOString(), 'dispatcher terminal response accepted by control plane', workflowA, 'p1', { tunnel_request_id: 'tsr_1' }),
+      event(new Date(p0 + 9_000).toISOString(), workflowB, 'pb2'),
+    ] },
+    health,
+    now: p0 + 13_000,
+  });
+
+  const postFinalOpen = precise.find(value => value.kind === 'post_final_stall_open' && value.workflow === workflowA);
+  assert.ok(postFinalOpen, 'workflow A should emit a post-final stall after the accepted final response');
+  assert.equal(postFinalOpen.post_final_gap_ms_at_detection, 10_800);
+  assert.equal(postFinalOpen.tunnel_request_id, 'tsr_1');
+  assert.ok(lifecycle.some(value => value.kind === 'workflow_mcp_final_received'));
+  assert.ok(lifecycle.some(value => value.kind === 'workflow_final_post_started'));
+  assert.ok(lifecycle.some(value => value.kind === 'workflow_final_post_accepted'));
+
+  preciseTracker.observe({
+    logs: { events: [
+      event(new Date(p0).toISOString(), workflowA, 'p1'),
+      event(new Date(p0 + 1_000).toISOString(), workflowB, 'pb1'),
+      lifecycleEvent(new Date(p0 + 2_000).toISOString(), 'dispatcher received terminal response from MCP server', workflowA, 'p1', { status_code: 200 }),
+      lifecycleEvent(new Date(p0 + 2_100).toISOString(), 'dispatcher posting terminal response to control plane', workflowA, 'p1'),
+      lifecycleEvent(new Date(p0 + 2_200).toISOString(), 'dispatcher terminal response accepted by control plane', workflowA, 'p1', { tunnel_request_id: 'tsr_1' }),
+      event(new Date(p0 + 9_000).toISOString(), workflowB, 'pb2'),
+      event(new Date(p0 + 15_000).toISOString(), workflowA, 'p2'),
+    ] },
+    health,
+    now: p0 + 15_100,
+  });
+
+  const postFinalRecovered = precise.find(value => value.kind === 'post_final_stall_recovered' && value.workflow === workflowA);
+  assert.ok(postFinalRecovered, 'workflow A should recover the post-final stall on the next command');
+  assert.equal(postFinalRecovered.post_final_gap_ms, 12_800);
+  const nextLifecycle = lifecycle.find(value => value.kind === 'workflow_next_command_arrived' && value.workflow === workflowA);
+  assert.ok(nextLifecycle, 'next workflow command should be persisted with the post-final gap');
+  assert.equal(nextLifecycle.post_final_gap_ms, 12_800);
+
+  console.log('PASS: workflow stall tracker records open/recovered and exact post-final gaps');
   return true;
 }
 

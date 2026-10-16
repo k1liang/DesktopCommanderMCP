@@ -50,6 +50,7 @@ const workflowLogLimit = Math.max(100, parseNonNegativeInt('TUNNEL_WORKFLOW_LOG_
 const diagnosticsDir = process.env.DC_RESILIENT_MCP_DIAGNOSTICS_DIR || DEFAULT_DIAGNOSTICS_DIR;
 const healthUrlFile = process.env.HEALTH_URL_FILE || path.join(diagnosticsDir, 'tunnel-health-url.txt');
 const workflowStallLog = path.join(diagnosticsDir, 'workflow-stalls.jsonl');
+const workflowLifecycleLog = path.join(diagnosticsDir, 'workflow-lifecycle.jsonl');
 
 let child = null;
 let proxy = null;
@@ -92,12 +93,14 @@ function startWorkflowMonitor() {
   workflowMonitor = new WorkflowStallMonitor({
     healthUrlFile,
     logPath: workflowStallLog,
+    lifecycleLogPath: workflowLifecycleLog,
     stallMs: workflowStallMs,
     intervalMs: workflowMonitorIntervalMs,
     logLimit: workflowLogLimit,
   });
   workflowMonitor.start();
   process.stderr.write(`[tunnel-supervisor] workflow stall monitor -> ${workflowStallLog}\n`);
+  process.stderr.write(`[tunnel-supervisor] workflow lifecycle -> ${workflowLifecycleLog}\n`);
 }
 
 function stopWorkflowMonitor() {

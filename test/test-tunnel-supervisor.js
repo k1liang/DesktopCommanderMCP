@@ -38,6 +38,7 @@ assert.match(macInit, /TUNNEL_SUPERVISOR_ONESHOT=1/, 'Mac init doctor must run t
 assert.match(supervisorSource, /WorkflowStallMonitor/, 'supervisor must enable per-workflow stall monitoring');
 assert.match(supervisorSource, /HEALTH_URL_FILE/, 'supervisor must publish tunnel health/admin URL for the workflow monitor');
 assert.match(supervisorSource, /workflow-stalls\.jsonl/, 'supervisor must persist workflow stall diagnostics');
+assert.match(supervisorSource, /workflow-lifecycle\.jsonl/, 'supervisor must persist workflow response lifecycle diagnostics');
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-tunnel-supervisor-'));
 const statePath = path.join(tempDir, 'attempts.txt');

@@ -7,26 +7,43 @@ function workflowId(cmdRequestId) {
   return slash > 0 ? value.slice(0, slash) : value || null;
 }
 
-function commandEvents(logPayload) {
+const WORKFLOW_EVENT_STAGES = new Map([
+  ['dispatcher forwarded command to MCP server', 'command_arrived'],
+  ['dispatcher received terminal response from MCP server', 'mcp_final_received'],
+  ['dispatcher posting terminal response to control plane', 'final_post_started'],
+  ['dispatcher terminal response accepted by control plane', 'final_post_accepted'],
+]);
+
+function lifecycleEvents(logPayload) {
   return (logPayload?.events ?? [])
-    .filter(event => event?.message === 'dispatcher forwarded command to MCP server')
     .map(event => {
+      const stage = WORKFLOW_EVENT_STAGES.get(event?.message);
+      if (!stage) return null;
       const attrs = event.attrs ?? {};
       const cmdRequestId = String(attrs.cmd_request_id ?? '');
       const workflow = workflowId(cmdRequestId);
       const at = Date.parse(event.time);
       if (!workflow || !Number.isFinite(at)) return null;
       return {
-        key: `${event.time}|${cmdRequestId}|${attrs.request_id ?? ''}`,
+        key: `${stage}|${event.time}|${cmdRequestId}|${attrs.request_id ?? ''}`,
+        stage,
         at,
         time: event.time,
         workflow,
         cmdRequestId,
         requestId: attrs.request_id ?? null,
+        tunnelServiceRequestId: attrs.tunnel_request_id ?? attrs.tunnel_service_request_id ?? null,
+        channel: attrs.channel ?? null,
+        rpcMethod: attrs.rpc_method ?? null,
+        statusCode: attrs.status_code ?? null,
       };
     })
     .filter(Boolean)
     .sort((a, b) => a.at - b.at);
+}
+
+function commandEvents(logPayload) {
+  return lifecycleEvents(logPayload).filter(event => event.stage === 'command_arrived');
 }
 
 function healthSummary(health) {
@@ -50,10 +67,12 @@ function healthSummary(health) {
 }
 
 export class WorkflowStallTracker {
-  constructor({ stallMs = 10_000, appendEvent = () => {} } = {}) {
+  constructor({ stallMs = 10_000, appendEvent = () => {}, appendLifecycleEvent = () => {} } = {}) {
     this.stallMs = stallMs;
     this.appendEvent = appendEvent;
+    this.appendLifecycleEvent = appendLifecycleEvent;
     this.states = new Map();
+    this.finalStates = new Map();
     this.recentCommands = [];
     this.seen = new Set();
     this.seenOrder = [];
@@ -62,6 +81,7 @@ export class WorkflowStallTracker {
 
   reset() {
     this.states.clear();
+    this.finalStates.clear();
     this.recentCommands = [];
     this.seen.clear();
     this.seenOrder = [];
@@ -69,31 +89,66 @@ export class WorkflowStallTracker {
   }
 
   observe({ logs, health, now = Date.now() }) {
-    const events = commandEvents(logs);
-    if (!this.bootstrapped) {
-      for (const event of events) {
-        this.remember(event);
-        this.states.set(event.workflow, {
-          lastCommandAt: event.at,
-          lastCommandTime: event.time,
-          lastCmdRequestId: event.cmdRequestId,
-          lastRequestId: event.requestId,
-          commandCount: (this.states.get(event.workflow)?.commandCount ?? 0) + 1,
-          eligible: now - event.at < this.stallMs,
-          open: null,
-        });
-      }
-      this.bootstrapped = true;
-    } else {
-      for (const event of events) {
-        if (this.seen.has(event.key)) continue;
-        this.remember(event);
+    const events = lifecycleEvents(logs);
+    const emit = this.bootstrapped;
+
+    for (const event of events) {
+      if (this.seen.has(event.key)) continue;
+      this.remember(event);
+
+      if (event.stage === 'command_arrived') {
+        const pendingFinal = this.finalStates.get(event.workflow);
+        if (pendingFinal && event.at > pendingFinal.acceptedAt && event.cmdRequestId !== pendingFinal.cmdRequestId) {
+          const others = this.otherCommandsBetween(event.workflow, pendingFinal.acceptedAt, event.at);
+          const postFinalGapMs = event.at - pendingFinal.acceptedAt;
+          if (emit) {
+            this.appendLifecycleEvent({
+              kind: 'workflow_next_command_arrived',
+              time: event.time,
+              workflow: event.workflow,
+              previous_final_accepted_time: pendingFinal.acceptedTime,
+              previous_cmd_request_id: pendingFinal.cmdRequestId,
+              previous_request_id: pendingFinal.requestId,
+              next_cmd_request_id: event.cmdRequestId,
+              next_request_id: event.requestId,
+              post_final_gap_ms: postFinalGapMs,
+            });
+            if (pendingFinal.open) {
+              this.appendEvent({
+                kind: 'post_final_stall_recovered',
+                time: event.time,
+                workflow: event.workflow,
+                final_accepted_time: pendingFinal.acceptedTime,
+                previous_cmd_request_id: pendingFinal.cmdRequestId,
+                previous_request_id: pendingFinal.requestId,
+                next_command_time: event.time,
+                next_cmd_request_id: event.cmdRequestId,
+                next_request_id: event.requestId,
+                post_final_gap_ms: postFinalGapMs,
+                open_detected_at: pendingFinal.open.detectedAt,
+                other_commands_during_gap: others.length,
+                other_workflows_during_gap: new Set(others.map(item => item.workflow)).size,
+                ...healthSummary(health),
+              });
+            }
+          }
+          this.finalStates.delete(event.workflow);
+        } else if (emit) {
+          this.appendLifecycleEvent({
+            kind: 'workflow_command_arrived',
+            time: event.time,
+            workflow: event.workflow,
+            cmd_request_id: event.cmdRequestId,
+            request_id: event.requestId,
+          });
+        }
+
         const previous = this.states.get(event.workflow);
-        if (previous?.open) {
+        if (emit && previous?.open) {
           const others = this.otherCommandsBetween(event.workflow, previous.lastCommandAt, event.at);
           this.appendEvent({
             kind: 'workflow_stall_recovered',
-            time: new Date(event.at).toISOString(),
+            time: event.time,
             workflow: event.workflow,
             previous_command_time: previous.lastCommandTime,
             previous_cmd_request_id: previous.lastCmdRequestId,
@@ -114,19 +169,46 @@ export class WorkflowStallTracker {
           lastCmdRequestId: event.cmdRequestId,
           lastRequestId: event.requestId,
           commandCount: (previous?.commandCount ?? 0) + 1,
-          eligible: true,
+          eligible: emit || now - event.at < this.stallMs,
+          open: null,
+        });
+        continue;
+      }
+
+      if (emit) {
+        this.appendLifecycleEvent({
+          kind: 'workflow_' + event.stage,
+          time: event.time,
+          workflow: event.workflow,
+          cmd_request_id: event.cmdRequestId,
+          request_id: event.requestId,
+          tunnel_request_id: event.tunnelServiceRequestId,
+          channel: event.channel,
+          rpc_method: event.rpcMethod,
+          status_code: event.statusCode,
+        });
+      }
+
+      if (event.stage === 'final_post_accepted') {
+        this.finalStates.set(event.workflow, {
+          acceptedAt: event.at,
+          acceptedTime: event.time,
+          cmdRequestId: event.cmdRequestId,
+          requestId: event.requestId,
+          tunnelServiceRequestId: event.tunnelServiceRequestId,
+          commandCount: this.states.get(event.workflow)?.commandCount ?? 0,
+          eligible: emit || now - event.at < this.stallMs,
           open: null,
         });
       }
     }
+    this.bootstrapped = true;
 
     for (const [workflow, state] of this.states) {
       if (!state.eligible || state.open || now - state.lastCommandAt < this.stallMs) continue;
       const others = this.otherCommandsBetween(workflow, state.lastCommandAt, now);
       if (others.length === 0) continue;
-      const open = {
-        detectedAt: new Date(now).toISOString(),
-      };
+      const open = { detectedAt: new Date(now).toISOString() };
       state.open = open;
       this.appendEvent({
         kind: 'workflow_stall_open',
@@ -145,6 +227,30 @@ export class WorkflowStallTracker {
       });
     }
 
+    for (const [workflow, state] of this.finalStates) {
+      if (!state.eligible || state.open || now - state.acceptedAt < this.stallMs) continue;
+      const others = this.otherCommandsBetween(workflow, state.acceptedAt, now);
+      if (others.length === 0) continue;
+      const open = { detectedAt: new Date(now).toISOString() };
+      state.open = open;
+      this.appendEvent({
+        kind: 'post_final_stall_open',
+        time: open.detectedAt,
+        workflow,
+        final_accepted_time: state.acceptedTime,
+        previous_cmd_request_id: state.cmdRequestId,
+        previous_request_id: state.requestId,
+        tunnel_request_id: state.tunnelServiceRequestId,
+        post_final_gap_ms_at_detection: now - state.acceptedAt,
+        threshold_ms: this.stallMs,
+        command_count: state.commandCount,
+        other_commands_since_final: others.length,
+        other_workflows_since_final: new Set(others.map(item => item.workflow)).size,
+        candidate_only: true,
+        ...healthSummary(health),
+      });
+    }
+
     const cutoff = now - Math.max(this.stallMs * 30, 10 * 60_000);
     this.recentCommands = this.recentCommands.filter(event => event.at >= cutoff);
   }
@@ -152,7 +258,7 @@ export class WorkflowStallTracker {
   remember(event) {
     this.seen.add(event.key);
     this.seenOrder.push(event.key);
-    this.recentCommands.push(event);
+    if (event.stage === 'command_arrived') this.recentCommands.push(event);
     while (this.seenOrder.length > 10_000) {
       this.seen.delete(this.seenOrder.shift());
     }
@@ -171,6 +277,7 @@ export class WorkflowStallMonitor {
   constructor({
     healthUrlFile,
     logPath,
+    lifecycleLogPath,
     stallMs = 10_000,
     intervalMs = 2_000,
     logLimit = 1_000,
@@ -178,6 +285,7 @@ export class WorkflowStallMonitor {
   }) {
     this.healthUrlFile = healthUrlFile;
     this.logPath = logPath;
+    this.lifecycleLogPath = lifecycleLogPath;
     this.intervalMs = intervalMs;
     this.logLimit = logLimit;
     this.fetchImpl = fetchImpl;
@@ -185,10 +293,14 @@ export class WorkflowStallMonitor {
     this.timer = null;
     this.inSample = false;
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    if (lifecycleLogPath) fs.mkdirSync(path.dirname(lifecycleLogPath), { recursive: true });
     this.tracker = new WorkflowStallTracker({
       stallMs,
       appendEvent: event => {
         fs.appendFileSync(this.logPath, JSON.stringify(event) + '\n', 'utf8');
+      },
+      appendLifecycleEvent: event => {
+        if (this.lifecycleLogPath) fs.appendFileSync(this.lifecycleLogPath, JSON.stringify(event) + '\n', 'utf8');
       },
     });
   }
@@ -234,4 +346,4 @@ export class WorkflowStallMonitor {
   }
 }
 
-export { commandEvents, healthSummary, workflowId };
+export { commandEvents, lifecycleEvents, healthSummary, workflowId };
