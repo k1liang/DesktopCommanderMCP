@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startResilientMcpProxy } from '../dist/resilient-mcp-proxy.js';
 
@@ -19,7 +22,16 @@ async function waitForExit(child) {
 }
 
 async function run() {
-  const proxy = await startResilientMcpProxy({ port: 0, resultPageBytes: 4096 });
+  const diagnosticsDir = await mkdtemp(path.join(os.tmpdir(), 'dc-resilient-proxy-'));
+  const proxy = await startResilientMcpProxy({
+    port: 0,
+    resultPageBytes: 4096,
+    diagnosticsDir,
+    stallThresholdMs: 0,
+    messageGapThresholdMs: 0,
+    sequenceBlockSize: 8n,
+  });
+  let lastSequence = 0n;
   try {
     const list1 = await post(proxy.url, {
       jsonrpc: '2.0',
@@ -103,11 +115,45 @@ async function run() {
     }
     assert.equal(pageCount, firstMeta.total_pages, 'all paginated pages should be retrievable');
 
+    const repoRoot = fileURLToPath(new URL('../', import.meta.url));
+    const search = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 30,
+      method: 'tools/call',
+      params: {
+        name: 'start_search',
+        arguments: {
+          path: repoRoot,
+          pattern: 'package.json',
+          searchType: 'files',
+          maxResults: 20,
+        },
+      },
+    });
+    const searchText = search.result?.content?.[0]?.text ?? '';
+    const searchId = searchText.match(/started .* search session:\s*(search_[^\s]+)/i)?.[1];
+    assert.ok(searchId, 'start_search should return a session id');
+
     const generationBefore = proxy.session.childGeneration;
     const child = proxy.session.child;
     assert.ok(child?.pid, 'proxy should own a live Desktop Commander child');
     child.kill();
     await waitForExit(child);
+
+    const resumedSearch = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 31,
+      method: 'tools/call',
+      params: {
+        name: 'get_more_search_results',
+        arguments: { sessionId: searchId, offset: 0, length: 20 },
+      },
+    });
+    assert.equal(resumedSearch.result?.isError, undefined, 'search should transparently recover after child replacement');
+    const resumedText = resumedSearch.result?.content?.[0]?.text ?? '';
+    assert.match(resumedText, new RegExp(searchId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'recovered search keeps the external session id');
+    assert.doesNotMatch(resumedText, /not found/i);
+    assert.ok(proxy.session.childGeneration > generationBefore, 'child generation should advance after recovery');
 
     const list2 = await post(proxy.url, {
       jsonrpc: '2.0',
@@ -116,17 +162,59 @@ async function run() {
       params: {},
     });
     assert.ok(Array.isArray(list2.result?.tools), 'tools/list should recover after child replacement');
-    assert.ok(proxy.session.childGeneration > generationBefore, 'child generation should advance after recovery');
 
     const health = await fetch(`http://${proxy.host}:${proxy.port}/healthz`).then(response => response.json());
     assert.equal(health.ok, true);
     assert.equal(health.childReady, true);
+    assert.equal(health.stallThresholdMs, 0);
+    assert.equal(health.messageGapThresholdMs, 0);
+    assert.equal(health.stallLogPath, proxy.diagnostics.stallLogPath);
 
-    console.log('PASS: resilient MCP proxy handles cold requests and child replacement');
-    return true;
+    const firstEvents = (await readFile(proxy.diagnostics.stallLogPath, 'utf8'))
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    const firstToolStalls = firstEvents.filter(event => event.kind === 'tool_stall');
+    assert.ok(firstToolStalls.length > 0, 'tool calls should be captured in the dedicated stall log');
+    assert.ok(firstEvents.some(event => event.kind === 'continuation_gap_candidate'), 'continuation gaps should be captured in the dedicated stall log');
+    assert.ok(firstEvents.some(event => event.kind === 'search_session_rehydrated'), 'child replacement should record search rehydration');
+    for (let i = 1; i < firstToolStalls.length; i += 1) {
+      assert.ok(BigInt(firstToolStalls[i].seq) > BigInt(firstToolStalls[i - 1].seq), 'tool message sequence must increase');
+    }
+    lastSequence = BigInt(firstToolStalls.at(-1).seq);
   } finally {
     await proxy.close();
   }
+
+  const proxy2 = await startResilientMcpProxy({
+    port: 0,
+    diagnosticsDir,
+    stallThresholdMs: 0,
+    messageGapThresholdMs: 0,
+    sequenceBlockSize: 8n,
+  });
+  try {
+    await post(proxy2.url, {
+      jsonrpc: '2.0',
+      id: 40,
+      method: 'tools/call',
+      params: { name: 'get_config', arguments: { origin: 'llm' } },
+    });
+    const secondEvents = (await readFile(proxy2.diagnostics.stallLogPath, 'utf8'))
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    const secondToolStalls = secondEvents.filter(event => event.kind === 'tool_stall');
+    assert.ok(BigInt(secondToolStalls.at(-1).seq) > lastSequence, 'message sequence must remain monotonic after proxy restart');
+  } finally {
+    await proxy2.close();
+    await rm(diagnosticsDir, { recursive: true, force: true });
+  }
+
+  console.log('PASS: resilient MCP proxy preserves search sessions and persistent diagnostic sequencing');
+  return true;
 }
 
 run().then(

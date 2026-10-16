@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +17,11 @@ const DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RESULT_PAGE_BYTES = 32 * 1024;
 const DEFAULT_RESULT_PAGE_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_RESULT_PAGE_MAX_ENTRIES = 64;
+const DEFAULT_SEARCH_SESSION_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_STALL_THRESHOLD_MS = 1_500;
+const DEFAULT_MESSAGE_GAP_THRESHOLD_MS = 10_000;
+const DEFAULT_SEQUENCE_BLOCK_SIZE = 1_024n;
+const DEFAULT_DIAGNOSTICS_DIR = path.join(os.homedir(), '.claude-server-commander', 'tunnel-diagnostics');
 const RESULT_PAGE_TOOL_NAME = 'get_result_page';
 
 type JsonRpcId = string | number | null;
@@ -32,6 +39,24 @@ type CachedPagedResult = {
   originalTool: string;
 };
 
+type CachedSearchSession = {
+  externalSessionId: string;
+  childSessionId: string;
+  generation: number;
+  startMessage: JsonObject;
+  expiresAt: number;
+  rehydrations: number;
+};
+
+type MessageStamp = {
+  seq: bigint;
+  processIndex: number;
+  sincePreviousMessageMs: number | null;
+  previousSeq: bigint | null;
+  previousMethod: string | null;
+  previousTool: string | null;
+};
+
 export type ResilientMcpProxyOptions = {
   host?: string;
   port?: number;
@@ -43,7 +68,181 @@ export type ResilientMcpProxyOptions = {
   resultPageBytes?: number;
   resultPageTtlMs?: number;
   resultPageMaxEntries?: number;
+  searchSessionTtlMs?: number;
+  stallThresholdMs?: number;
+  messageGapThresholdMs?: number;
+  diagnosticsDir?: string;
+  sequenceBlockSize?: bigint;
 };
+
+class ProxyDiagnostics {
+  readonly directory: string;
+  readonly stallLogPath: string;
+  readonly stallThresholdMs: number;
+  readonly messageGapThresholdMs: number;
+
+  private readonly sequenceStatePath: string;
+  private readonly sequenceBlockSize: bigint;
+  private sequence = 0n;
+  private reservedUntil = 0n;
+  private sequencePersistenceAvailable = true;
+  private processIndex = 0;
+  private previousMessageAt: number | null = null;
+  private previousMessageSeq: bigint | null = null;
+  private previousMessageMethod: string | null = null;
+  private previousMessageTool: string | null = null;
+  private lastStallSeq: bigint | null = null;
+
+  constructor(options: ResilientMcpProxyOptions) {
+    this.directory = options.diagnosticsDir ?? DEFAULT_DIAGNOSTICS_DIR;
+    this.stallLogPath = path.join(this.directory, 'stalls.jsonl');
+    this.sequenceStatePath = path.join(this.directory, 'message-sequence.txt');
+    this.stallThresholdMs = Math.max(0, Math.floor(options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS));
+    this.messageGapThresholdMs = Math.max(0, Math.floor(options.messageGapThresholdMs ?? DEFAULT_MESSAGE_GAP_THRESHOLD_MS));
+    this.sequenceBlockSize = options.sequenceBlockSize && options.sequenceBlockSize > 0n
+      ? options.sequenceBlockSize
+      : DEFAULT_SEQUENCE_BLOCK_SIZE;
+
+    mkdirSync(this.directory, { recursive: true });
+    this.reserveSequenceBlock();
+  }
+
+  nextMessage(message: JsonObject): MessageStamp {
+    if (this.sequence >= this.reservedUntil) this.reserveSequenceBlock();
+
+    this.sequence += 1n;
+    this.processIndex += 1;
+    const now = Date.now();
+    const sincePreviousMessageMs = this.previousMessageAt === null ? null : now - this.previousMessageAt;
+    const previousSeq = this.previousMessageSeq;
+    const previousMethod = this.previousMessageMethod;
+    const previousTool = this.previousMessageTool;
+    const method = String(message?.method ?? 'unknown');
+    const tool = method === 'tools/call' ? String(message?.params?.name ?? 'unknown') : null;
+
+    if (sincePreviousMessageMs !== null && sincePreviousMessageMs >= this.messageGapThresholdMs) {
+      const previousStallSeq = this.lastStallSeq;
+      const messagesSincePreviousStall = previousStallSeq === null ? null : this.sequence - previousStallSeq;
+      this.appendStallEvent({
+        kind: 'continuation_gap_candidate',
+        time: new Date(now).toISOString(),
+        previous_seq: previousSeq?.toString() ?? null,
+        seq: this.sequence.toString(),
+        gap_ms: sincePreviousMessageMs,
+        threshold_ms: this.messageGapThresholdMs,
+        previous_method: previousMethod,
+        previous_tool: previousTool,
+        method,
+        tool,
+        process_message_index: this.processIndex,
+        previous_stall_seq: previousStallSeq?.toString() ?? null,
+        messages_since_previous_stall: messagesSincePreviousStall?.toString() ?? null,
+      });
+    }
+
+    this.previousMessageAt = now;
+    this.previousMessageSeq = this.sequence;
+    this.previousMessageMethod = method;
+    this.previousMessageTool = tool;
+    return {
+      seq: this.sequence,
+      processIndex: this.processIndex,
+      sincePreviousMessageMs,
+      previousSeq,
+      previousMethod,
+      previousTool,
+    };
+  }
+
+  recordToolCall(meta: {
+    stamp: MessageStamp;
+    toolName: string;
+    durationMs: number;
+    outcome: string;
+    responseBytes: number;
+    paged: boolean;
+    active: number;
+    generation: number;
+  }): void {
+    const { stamp } = meta;
+    process.stderr.write(
+      `[resilient-mcp-proxy] INFO tools/call seq=${stamp.seq} tool=${meta.toolName} duration_ms=${meta.durationMs} ` +
+      `outcome=${meta.outcome} response_bytes=${meta.responseBytes} paged=${meta.paged} active=${meta.active} ` +
+      `generation=${meta.generation}\n`,
+    );
+
+    if (meta.durationMs < this.stallThresholdMs) return;
+
+    const previousStallSeq = this.lastStallSeq;
+    const messagesSincePreviousStall = previousStallSeq === null ? null : stamp.seq - previousStallSeq;
+    this.lastStallSeq = stamp.seq;
+    this.appendStallEvent({
+      kind: 'tool_stall',
+      time: new Date().toISOString(),
+      seq: stamp.seq.toString(),
+      process_message_index: stamp.processIndex,
+      previous_stall_seq: previousStallSeq?.toString() ?? null,
+      messages_since_previous_stall: messagesSincePreviousStall?.toString() ?? null,
+      since_previous_message_ms: stamp.sincePreviousMessageMs,
+      previous_message_seq: stamp.previousSeq?.toString() ?? null,
+      previous_message_method: stamp.previousMethod,
+      previous_message_tool: stamp.previousTool,
+      tool: meta.toolName,
+      duration_ms: meta.durationMs,
+      threshold_ms: this.stallThresholdMs,
+      outcome: meta.outcome,
+      response_bytes: meta.responseBytes,
+      paged: meta.paged,
+      active: meta.active,
+      generation: meta.generation,
+      expected_process_poll: (meta.toolName === 'read_process_output' || meta.toolName === 'interact_with_process')
+        && meta.durationMs >= 4_500,
+    });
+  }
+
+  recordEvent(kind: string, fields: JsonObject): void {
+    this.appendStallEvent({
+      kind,
+      time: new Date().toISOString(),
+      ...fields,
+    });
+  }
+
+  private reserveSequenceBlock(): void {
+    let persistedHighWater = 0n;
+    if (this.sequencePersistenceAvailable) {
+      try {
+        const raw = readFileSync(this.sequenceStatePath, 'utf8').trim();
+        if (/^\d+$/.test(raw)) persistedHighWater = BigInt(raw);
+      } catch {}
+    }
+
+    const start = persistedHighWater > this.reservedUntil ? persistedHighWater : this.reservedUntil;
+    const nextHighWater = start + this.sequenceBlockSize;
+    if (this.sequencePersistenceAvailable) {
+      try {
+        writeFileSync(this.sequenceStatePath, nextHighWater.toString() + '\n', 'utf8');
+      } catch (error) {
+        this.sequencePersistenceAvailable = false;
+        process.stderr.write(
+          `[resilient-mcp-proxy] sequence persistence disabled: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+    }
+    this.sequence = start;
+    this.reservedUntil = nextHighWater;
+  }
+
+  private appendStallEvent(event: JsonObject): void {
+    try {
+      appendFileSync(this.stallLogPath, JSON.stringify(event) + '\n', 'utf8');
+    } catch (error) {
+      process.stderr.write(
+        `[resilient-mcp-proxy] stall log write failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+}
 
 class ChildDisconnectedError extends Error {
   readonly dispatched: boolean;
@@ -67,6 +266,7 @@ const KNOWN_READ_ONLY_TOOLS = new Set([
   'get_usage_stats',
   'get_recent_tool_calls',
   'list_searches',
+  'start_search',
   'get_more_search_results',
   RESULT_PAGE_TOOL_NAME,
 ]);
@@ -187,6 +387,7 @@ export class ResilientChildMcpSession {
   private initResult: JsonObject | null = null;
   private readonly readOnlyTools = new Map<string, boolean>();
   private readonly pagedResults = new Map<string, CachedPagedResult>();
+  private readonly searchSessions = new Map<string, CachedSearchSession>();
   private stopping = false;
 
   readonly childEntry: string;
@@ -196,8 +397,9 @@ export class ResilientChildMcpSession {
   readonly resultPageBytes: number;
   readonly resultPageTtlMs: number;
   readonly resultPageMaxEntries: number;
+  readonly searchSessionTtlMs: number;
 
-  constructor(options: ResilientMcpProxyOptions = {}) {
+  constructor(options: ResilientMcpProxyOptions = {}, private readonly diagnostics?: ProxyDiagnostics) {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const repoRoot = path.resolve(here, '..');
     this.childEntry = options.childEntry ?? path.join(repoRoot, 'dist', 'index.js');
@@ -207,6 +409,7 @@ export class ResilientChildMcpSession {
     this.resultPageBytes = Math.max(1024, Math.floor(options.resultPageBytes ?? DEFAULT_RESULT_PAGE_BYTES));
     this.resultPageTtlMs = Math.max(1000, Math.floor(options.resultPageTtlMs ?? DEFAULT_RESULT_PAGE_TTL_MS));
     this.resultPageMaxEntries = Math.max(1, Math.floor(options.resultPageMaxEntries ?? DEFAULT_RESULT_PAGE_MAX_ENTRIES));
+    this.searchSessionTtlMs = Math.max(60_000, Math.floor(options.searchSessionTtlMs ?? DEFAULT_SEARCH_SESSION_TTL_MS));
   }
 
   get isReady(): boolean {
@@ -233,6 +436,7 @@ export class ResilientChildMcpSession {
     const child = this.child;
     this.child = null;
     this.pagedResults.clear();
+    this.searchSessions.clear();
     this.rejectAllPending(new ChildDisconnectedError('Desktop Commander proxy is stopping', false));
     if (child && child.exitCode === null && child.signalCode === null) {
       try { child.kill(); } catch {}
@@ -269,6 +473,9 @@ export class ResilientChildMcpSession {
     if (method === 'tools/call' && isRequest(message)) {
       const toolName = String(message?.params?.name ?? '');
       if (toolName === RESULT_PAGE_TOOL_NAME) return this.handleResultPageCall(message);
+      if (toolName === 'start_search' || toolName === 'get_more_search_results' || toolName === 'stop_search') {
+        return this.handleSearchToolCall(message);
+      }
 
       const legacyPagePath = toolName === 'read_file'
         ? String(message?.params?.arguments?.path ?? '')
@@ -333,6 +540,157 @@ export class ResilientChildMcpSession {
     }
 
     return this.forwardRequestWithRecovery(message);
+  }
+
+  private async handleSearchToolCall(message: JsonObject): Promise<JsonObject> {
+    this.sweepSearchSessions();
+    const toolName = String(message?.params?.name ?? '');
+
+    if (toolName === 'start_search') {
+      const response = await this.forwardRequestWithRecovery(message);
+      const sessionId = this.searchSessionIdFromResponse(response);
+      if (sessionId) {
+        this.searchSessions.set(sessionId, {
+          externalSessionId: sessionId,
+          childSessionId: sessionId,
+          generation: this.generation,
+          startMessage: JSON.parse(JSON.stringify(message)),
+          expiresAt: Date.now() + this.searchSessionTtlMs,
+          rehydrations: 0,
+        });
+      }
+      return response;
+    }
+
+    const externalSessionId = String(message?.params?.arguments?.sessionId ?? '');
+    const cached = this.searchSessions.get(externalSessionId);
+    if (!cached) return this.forwardRequestWithRecovery(message);
+
+    cached.expiresAt = Date.now() + this.searchSessionTtlMs;
+    await this.ensureReady();
+
+    if (toolName === 'stop_search' && cached.generation !== this.generation) {
+      this.searchSessions.delete(externalSessionId);
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          content: [{
+            type: 'text',
+            text: `Search session ${externalSessionId} terminated because its Desktop Commander child was already replaced.`,
+          }],
+        },
+      };
+    }
+
+    if (cached.generation !== this.generation) await this.rehydrateSearchSession(cached);
+
+    let forwarded = this.withChildSearchSessionId(message, cached.childSessionId);
+    let response = await this.forwardRequestWithRecovery(forwarded);
+
+    if (toolName === 'get_more_search_results' && this.isSearchSessionNotFound(response)) {
+      await this.rehydrateSearchSession(cached);
+      forwarded = this.withChildSearchSessionId(message, cached.childSessionId);
+      response = await this.forwardRequestWithRecovery(forwarded);
+    }
+
+    if (toolName === 'stop_search' && response?.result?.isError !== true && !response?.error) {
+      this.searchSessions.delete(externalSessionId);
+    }
+
+    return this.rewriteSearchSessionId(response, cached.childSessionId, externalSessionId);
+  }
+
+  private async rehydrateSearchSession(cached: CachedSearchSession): Promise<void> {
+    await this.ensureReady();
+    const response = await this.forwardRequestWithRecovery(cached.startMessage);
+    const childSessionId = this.searchSessionIdFromResponse(response);
+    if (!childSessionId || response?.result?.isError === true || response?.error) {
+      throw new Error(`Failed to recover search session ${cached.externalSessionId} after child replacement`);
+    }
+
+    cached.childSessionId = childSessionId;
+    cached.generation = this.generation;
+    cached.expiresAt = Date.now() + this.searchSessionTtlMs;
+    cached.rehydrations += 1;
+    this.diagnostics?.recordEvent('search_session_rehydrated', {
+      external_session_id: cached.externalSessionId,
+      child_session_id: cached.childSessionId,
+      generation: cached.generation,
+      rehydrations: cached.rehydrations,
+    });
+  }
+
+  private searchSessionIdFromResponse(response: JsonObject): string | null {
+    const sessionId = response?.result?.structuredContent?.sessionId;
+    if (typeof sessionId === 'string' && sessionId) return sessionId;
+
+    const content = response?.result?.content;
+    if (!Array.isArray(content)) return null;
+    for (const block of content) {
+      if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+      const match = block.text.match(/(?:started .* search session:|search session:)\s*(search_[^\s]+)/i);
+      if (match?.[1]) return match[1];
+    }
+    return null;
+  }
+
+  private withChildSearchSessionId(message: JsonObject, childSessionId: string): JsonObject {
+    return {
+      ...message,
+      params: {
+        ...message.params,
+        arguments: {
+          ...message?.params?.arguments,
+          sessionId: childSessionId,
+        },
+      },
+    };
+  }
+
+  private rewriteSearchSessionId(response: JsonObject, childSessionId: string, externalSessionId: string): JsonObject {
+    if (childSessionId === externalSessionId) return response;
+
+    const result = response?.result;
+    if (!result || typeof result !== 'object') return response;
+
+    const content = Array.isArray(result.content)
+      ? result.content.map((block: JsonObject) => (
+        block?.type === 'text' && typeof block.text === 'string'
+          ? { ...block, text: block.text.split(childSessionId).join(externalSessionId) }
+          : block
+      ))
+      : result.content;
+    const structuredContent = result.structuredContent && typeof result.structuredContent === 'object'
+      ? { ...result.structuredContent, sessionId: externalSessionId }
+      : result.structuredContent;
+
+    return {
+      ...response,
+      result: {
+        ...result,
+        content,
+        structuredContent,
+      },
+    };
+  }
+
+  private isSearchSessionNotFound(response: JsonObject): boolean {
+    if (response?.result?.isError !== true) return false;
+    const content = response?.result?.content;
+    if (!Array.isArray(content)) return false;
+    return content.some((block: JsonObject) => (
+      block?.type === 'text' &&
+      typeof block.text === 'string' &&
+      /search session .* not found/i.test(block.text)
+    ));
+  }
+
+  private sweepSearchSessions(): void {
+    const now = Date.now();
+    for (const [sessionId, cached] of this.searchSessions) {
+      if (cached.expiresAt <= now) this.searchSessions.delete(sessionId);
+    }
   }
 
   private async forwardRequestWithRecovery(message: JsonObject): Promise<JsonObject> {
@@ -568,6 +926,7 @@ export class ResilientChildMcpSession {
     this.initResult = null;
     this.stdoutBuffer = '';
     this.generation += 1;
+    this.diagnostics?.recordEvent('child_generation_started', { generation: this.generation });
 
     const child = spawn(process.execPath, [this.childEntry, ...this.childArgs], {
       cwd: path.dirname(path.dirname(this.childEntry)),
@@ -723,6 +1082,11 @@ export class ResilientChildMcpSession {
 
   private onChildExit(child: ChildProcessWithoutNullStreams, code: number | null, signal: NodeJS.Signals | null): void {
     if (this.child !== child) return;
+    this.diagnostics?.recordEvent('child_generation_exited', {
+      generation: this.generation,
+      exit_code: code,
+      signal: signal ?? null,
+    });
     this.child = null;
     this.ready = false;
     this.initResult = null;
@@ -768,6 +1132,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function logToolCallDuration(
+  diagnostics: ProxyDiagnostics,
+  stamp: MessageStamp,
   message: JsonObject,
   response: JsonObject | null,
   startedAt: number,
@@ -792,17 +1158,24 @@ function logToolCallDuration(
     responseBytes = response ? Buffer.byteLength(JSON.stringify(response), 'utf8') : 0;
   } catch {}
 
-  process.stderr.write(
-    `[resilient-mcp-proxy] INFO tools/call tool=${toolName} duration_ms=${durationMs} outcome=${outcome} ` +
-    `response_bytes=${responseBytes} paged=${paged} active=${active} generation=${generation}\n`,
-  );
+  diagnostics.recordToolCall({
+    stamp,
+    toolName,
+    durationMs,
+    outcome,
+    responseBytes,
+    paged,
+    active,
+    generation,
+  });
 }
 
 export async function startResilientMcpProxy(options: ResilientMcpProxyOptions = {}) {
   const host = options.host ?? DEFAULT_HOST;
   const port = options.port ?? DEFAULT_PORT;
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-  const session = new ResilientChildMcpSession(options);
+  const diagnostics = new ProxyDiagnostics(options);
+  const session = new ResilientChildMcpSession(options, diagnostics);
   let activeToolCalls = 0;
 
   const server = http.createServer(async (req, res) => {
@@ -815,6 +1188,9 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
           childReady: session.isReady,
           generation: session.childGeneration,
           resultPageBytes: session.resultPageBytes,
+          stallThresholdMs: diagnostics.stallThresholdMs,
+          messageGapThresholdMs: diagnostics.messageGapThresholdMs,
+          stallLogPath: diagnostics.stallLogPath,
         });
       }
 
@@ -845,6 +1221,7 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
       const responses: JsonObject[] = [];
 
       for (const message of messages) {
+        const stamp = diagnostics.nextMessage(message);
         if (!message || typeof message !== 'object' || typeof message.method !== 'string') {
           const id = message && typeof message === 'object' && 'id' in message ? (message.id as JsonRpcId) : null;
           responses.push(jsonRpcError(id, -32600, 'Invalid JSON-RPC request'));
@@ -858,12 +1235,12 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
         try {
           const response = await session.handle(message);
           if (toolCall) {
-            logToolCallDuration(message, response, startedAt, activeToolCalls, session.childGeneration);
+            logToolCallDuration(diagnostics, stamp, message, response, startedAt, activeToolCalls, session.childGeneration);
           }
           if (response) responses.push(response);
         } catch (error) {
           if (toolCall) {
-            logToolCallDuration(message, null, startedAt, activeToolCalls, session.childGeneration, error);
+            logToolCallDuration(diagnostics, stamp, message, null, startedAt, activeToolCalls, session.childGeneration, error);
           }
           throw error;
         } finally {
@@ -913,6 +1290,7 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
   return {
     server,
     session,
+    diagnostics,
     host,
     port: actualPort,
     url,
@@ -964,10 +1342,25 @@ if (entry === self) {
   if (options.resultPageMaxEntries === undefined && process.env.DC_RESILIENT_MCP_RESULT_PAGE_MAX_ENTRIES) {
     options.resultPageMaxEntries = Number(process.env.DC_RESILIENT_MCP_RESULT_PAGE_MAX_ENTRIES);
   }
+  if (options.searchSessionTtlMs === undefined && process.env.DC_RESILIENT_MCP_SEARCH_SESSION_TTL_MS) {
+    options.searchSessionTtlMs = Number(process.env.DC_RESILIENT_MCP_SEARCH_SESSION_TTL_MS);
+  }
+  if (options.stallThresholdMs === undefined && process.env.DC_RESILIENT_MCP_STALL_MS) {
+    options.stallThresholdMs = Number(process.env.DC_RESILIENT_MCP_STALL_MS);
+  }
+  if (options.messageGapThresholdMs === undefined && process.env.DC_RESILIENT_MCP_GAP_MS) {
+    options.messageGapThresholdMs = Number(process.env.DC_RESILIENT_MCP_GAP_MS);
+  }
+  if (!options.diagnosticsDir && process.env.DC_RESILIENT_MCP_DIAGNOSTICS_DIR) {
+    options.diagnosticsDir = path.resolve(process.env.DC_RESILIENT_MCP_DIAGNOSTICS_DIR);
+  }
 
   startResilientMcpProxy(options)
     .then(proxy => {
       process.stderr.write(`[resilient-mcp-proxy] listening at ${proxy.url}\n`);
+      process.stderr.write(
+        `[resilient-mcp-proxy] stall diagnostics threshold_ms=${proxy.diagnostics.stallThresholdMs} gap_ms=${proxy.diagnostics.messageGapThresholdMs} log=${proxy.diagnostics.stallLogPath}\n`,
+      );
 
       let closing = false;
       const close = async () => {

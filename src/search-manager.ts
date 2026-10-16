@@ -115,6 +115,9 @@ export interface SearchSessionOptions {
  */
 const EXACT_FILENAME_SEARCH_TIMEOUT_MS = 1500;
 
+/** Keep completed searches long enough for long ChatGPT tool workflows to resume pagination. */
+const COMPLETED_SEARCH_SESSION_TTL_MS = 30 * 60 * 1000;
+
 /** The longest a timer waits (2^31 - 1 ms, ~24.8 days): setTimeout fires a longer delay after 1 ms */
 const LONGEST_TIMER_MS = 2 ** 31 - 1;
 
@@ -940,7 +943,7 @@ const MAX_KEPT_ERROR_CHARS = 64 * 1024;
    * Clean up completed sessions older than specified time
    * Called automatically by cleanup interval
    */
-  cleanupSessions(maxAge: number = 5 * 60 * 1000): void {
+  cleanupSessions(maxAge: number = COMPLETED_SEARCH_SESSION_TTL_MS): void {
     const cutoffTime = Date.now() - maxAge;
     
     for (const [sessionId, session] of this.sessions) {
