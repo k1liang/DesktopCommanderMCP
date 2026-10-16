@@ -9,6 +9,7 @@ const testDir = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(testDir, '..');
 const supervisor = path.join(repo, 'tools', 'tunnel-supervisor.mjs');
 const fixture = path.join(testDir, 'fixtures', 'tunnel-supervisor-child.js');
+const supervisorSource = fs.readFileSync(supervisor, 'utf8');
 
 const windowsRun = fs.readFileSync(path.join(repo, 'tools', 'windows', 'tunnel-run.bat'), 'utf8');
 const windowsInit = fs.readFileSync(path.join(repo, 'tools', 'windows', 'tunnel-init.bat'), 'utf8');
@@ -34,6 +35,9 @@ assert.match(macInit, /--mcp-server-url/, 'Mac init must target the local HTTP p
 assert.match(macInit, /npm install[\s\S]*npm run build/, 'Mac init must install dependencies before building');
 assert.match(macInit, /init --force /, 'Mac init must replace the existing stdio profile');
 assert.match(macInit, /TUNNEL_SUPERVISOR_ONESHOT=1/, 'Mac init doctor must run through a one-shot proxy supervisor');
+assert.match(supervisorSource, /WorkflowStallMonitor/, 'supervisor must enable per-workflow stall monitoring');
+assert.match(supervisorSource, /HEALTH_URL_FILE/, 'supervisor must publish tunnel health/admin URL for the workflow monitor');
+assert.match(supervisorSource, /workflow-stalls\.jsonl/, 'supervisor must persist workflow stall diagnostics');
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-tunnel-supervisor-'));
 const statePath = path.join(tempDir, 'attempts.txt');

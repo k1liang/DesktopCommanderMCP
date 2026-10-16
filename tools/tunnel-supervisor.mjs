@@ -1,11 +1,18 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { WorkflowStallMonitor } from './workflow-stall-monitor.mjs';
 
 const DEFAULT_RESTART_DELAY_MS = 1500;
 const DEFAULT_PROXY_HOST = '127.0.0.1';
 const DEFAULT_PROXY_PORT = 8765;
+const DEFAULT_WORKFLOW_STALL_MS = 10_000;
+const DEFAULT_WORKFLOW_MONITOR_INTERVAL_MS = 2_000;
+const DEFAULT_WORKFLOW_LOG_LIMIT = 1_000;
+const DEFAULT_DIAGNOSTICS_DIR = path.join(os.homedir(), '.claude-server-commander', 'tunnel-diagnostics');
 
 function parseNonNegativeInt(name, fallback) {
   const raw = process.env[name];
@@ -34,11 +41,19 @@ if (!executable) {
 
 const oneShot = envEnabled('TUNNEL_SUPERVISOR_ONESHOT');
 const resilientProxyEnabled = envEnabled('TUNNEL_RESILIENT_PROXY');
+const workflowMonitorEnabled = resilientProxyEnabled && !envEnabled('TUNNEL_WORKFLOW_MONITOR_DISABLE');
 const proxyHost = process.env.DC_RESILIENT_MCP_HOST || DEFAULT_PROXY_HOST;
 const proxyPort = parseNonNegativeInt('DC_RESILIENT_MCP_PORT', DEFAULT_PROXY_PORT);
+const workflowStallMs = parseNonNegativeInt('TUNNEL_WORKFLOW_STALL_MS', DEFAULT_WORKFLOW_STALL_MS);
+const workflowMonitorIntervalMs = Math.max(500, parseNonNegativeInt('TUNNEL_WORKFLOW_MONITOR_INTERVAL_MS', DEFAULT_WORKFLOW_MONITOR_INTERVAL_MS));
+const workflowLogLimit = Math.max(100, parseNonNegativeInt('TUNNEL_WORKFLOW_LOG_LIMIT', DEFAULT_WORKFLOW_LOG_LIMIT));
+const diagnosticsDir = process.env.DC_RESILIENT_MCP_DIAGNOSTICS_DIR || DEFAULT_DIAGNOSTICS_DIR;
+const healthUrlFile = process.env.HEALTH_URL_FILE || path.join(diagnosticsDir, 'tunnel-health-url.txt');
+const workflowStallLog = path.join(diagnosticsDir, 'workflow-stalls.jsonl');
 
 let child = null;
 let proxy = null;
+let workflowMonitor = null;
 let stopping = false;
 let restartCount = 0;
 
@@ -71,6 +86,26 @@ async function stopProxy() {
   }
 }
 
+function startWorkflowMonitor() {
+  if (!workflowMonitorEnabled || workflowMonitor) return;
+  fs.mkdirSync(diagnosticsDir, { recursive: true });
+  workflowMonitor = new WorkflowStallMonitor({
+    healthUrlFile,
+    logPath: workflowStallLog,
+    stallMs: workflowStallMs,
+    intervalMs: workflowMonitorIntervalMs,
+    logLimit: workflowLogLimit,
+  });
+  workflowMonitor.start();
+  process.stderr.write(`[tunnel-supervisor] workflow stall monitor -> ${workflowStallLog}\n`);
+}
+
+function stopWorkflowMonitor() {
+  const current = workflowMonitor;
+  workflowMonitor = null;
+  current?.stop();
+}
+
 function requestStop(signal) {
   if (stopping) return;
   stopping = true;
@@ -88,14 +123,24 @@ async function runOnce() {
     const settle = (result) => {
       if (settled) return;
       settled = true;
+      stopWorkflowMonitor();
       resolve(result);
     };
 
+    if (workflowMonitorEnabled) {
+      fs.mkdirSync(diagnosticsDir, { recursive: true });
+      try { fs.rmSync(healthUrlFile, { force: true }); } catch {}
+    }
+
     child = spawn(executable, args, {
-      env: process.env,
+      env: {
+        ...process.env,
+        ...(workflowMonitorEnabled ? { HEALTH_URL_FILE: healthUrlFile } : {}),
+      },
       stdio: 'inherit',
       windowsHide: false,
     });
+    startWorkflowMonitor();
 
     child.once('error', error => settle({ code: null, signal: null, error }));
     child.once('exit', (code, signal) => settle({ code, signal, error: null }));
@@ -144,5 +189,6 @@ try {
   process.stderr.write(`[tunnel-supervisor] fatal: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
   process.exitCode = 1;
 } finally {
+  stopWorkflowMonitor();
   await stopProxy();
 }
