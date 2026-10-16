@@ -22,8 +22,10 @@ export interface TerminalSession {
   lastReadOpenLine: string;   // Text of the unfinished last line when a default read last returned it
   startTime: Date;
   bufferedChars: number;      // Joined length of outputLines (content + separators)
-  evictedLines: number;       // Lines dropped from the front to enforce the buffer cap
+  evictedLines: number;       // Lines dropped from the front to enforce the in-memory buffer cap
   evictedChars: number;       // Joined length of evicted lines (keeps snapshot offsets absolute)
+  archivedOutputPath?: string; // Evicted complete lines are appended here before leaving memory
+  archiveError?: string;       // Last archive failure; when set, some evicted output may be unrecoverable
 }
 
 export interface CommandExecutionResult {

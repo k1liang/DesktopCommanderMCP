@@ -412,12 +412,17 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
     statusMessage = `[Reading ${result.readCount} lines from line ${result.readFrom} (total: ${result.totalLines} lines, ${result.remaining} remaining)]`;
   }
 
-  // Surface buffer-cap eviction so the model knows the retained output is not
-  // the full output and that line numbers shifted (matches the truncation
-  // markers used by other tools).
+  // Surface memory-buffer eviction. Evicted complete lines are archived to
+  // disk before leaving memory, so long-running jobs keep their historical
+  // evidence without allowing one session to grow the Node heap without bound.
   if (result.evictedLines && result.evictedLines > 0) {
     const capMB = Math.round(MAX_BUFFERED_OUTPUT_CHARS / 1024 / 1024);
-    statusMessage += `\n[WARNING: output exceeded the ${capMB}MB buffer cap; the ${result.evictedLines} earliest lines were evicted and cannot be read. Line numbers and totals refer to the retained buffer only]`;
+    if (result.archivedOutputPath && !result.archiveError) {
+      statusMessage += `\n[NOTICE: output exceeded the ${capMB}MB in-memory buffer cap; the ${result.evictedLines} earliest lines were archived to ${result.archivedOutputPath}. Line numbers and totals below refer to the retained in-memory tail only; use read_file on the archive for historical output]`;
+    } else {
+      const reason = result.archiveError ? ` Archive failed: ${result.archiveError}` : '';
+      statusMessage += `\n[WARNING: output exceeded the ${capMB}MB buffer cap; the ${result.evictedLines} earliest lines left memory and may be unrecoverable.${reason} Line numbers and totals refer to the retained buffer only]`;
+    }
   }
 
   // Add process state info
@@ -451,6 +456,17 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
       type: "text",
       text: `${statusMessage}\n\n${responseText}${processStateMessage}${timingMessage}`
     }],
+    structuredContent: {
+      pid,
+      readFrom: result.readFrom,
+      readCount: result.readCount,
+      totalLines: result.totalLines,
+      remaining: result.remaining,
+      evictedLines: result.evictedLines ?? 0,
+      evictedChars: result.evictedChars ?? 0,
+      archivedOutputPath: result.archivedOutputPath ?? null,
+      archiveError: result.archiveError ?? null,
+    },
   };
 }
 
@@ -560,6 +576,9 @@ export async function interactWithProcess(args: unknown, maxWaitMs: number = MAX
 
     // Smart waiting with immediate and periodic detection
     let output = "";
+    let archivedOutputPath: string | undefined;
+    let archivedCharsSinceSnapshot = 0;
+    let archiveError: string | undefined;
     let processState: ProcessState | undefined;
     let earlyExit = false;
     let waitCapped = false;
@@ -587,7 +606,12 @@ export async function interactWithProcess(args: unknown, maxWaitMs: number = MAX
           if (resolved) return;
 
           const read = terminalManager.readOutputSince(pid, readPosition);
-          if (read) readPosition = read.next;
+          if (read) {
+            readPosition = read.next;
+            if (read.archivedOutputPath) archivedOutputPath = read.archivedOutputPath;
+            if (read.archivedCharsSinceSnapshot) archivedCharsSinceSnapshot += read.archivedCharsSinceSnapshot;
+            if (read.archiveError) archiveError = read.archiveError;
+          }
           const newOutput = read?.output ?? '';
 
           if (newOutput.length > 0) {
@@ -664,6 +688,16 @@ export async function interactWithProcess(args: unknown, maxWaitMs: number = MAX
       const remainingLines = outputLines.length - maxOutputLines;
       truncationMessage = `\n\n⚠️ Output truncated: showing ${maxOutputLines} of ${outputLines.length} lines (${remainingLines} hidden). Use read_process_output with offset/length for full output.`;
     }
+
+    let archiveMessage = '';
+    if (archivedCharsSinceSnapshot > 0) {
+      if (archivedOutputPath && !archiveError) {
+        archiveMessage = `\n\n📦 ${archivedCharsSinceSnapshot} characters from this interaction left the 50MB in-memory tail and were archived to ${archivedOutputPath}. Use read_file on the archive to recover the historical segment.`;
+      } else {
+        const reason = archiveError ? ` Archive failed: ${archiveError}` : '';
+        archiveMessage = `\n\n⚠️ ${archivedCharsSinceSnapshot} characters from this interaction left the in-memory buffer and may be unrecoverable.${reason}`;
+      }
+    }
     
     // Determine final state
     if (!processState) {
@@ -704,6 +738,9 @@ export async function interactWithProcess(args: unknown, maxWaitMs: number = MAX
       truncated: totalLines > shownLines,
       shownLines,
       totalLines,
+      archivedCharsSinceSnapshot,
+      archivedOutputPath: archivedOutputPath ?? null,
+      archiveError: archiveError ?? null,
       ...getWaitCapFields(timeoutReached && waitCapped ? waitLimit.capMs : undefined),
     };
 
@@ -711,7 +748,7 @@ export async function interactWithProcess(args: unknown, maxWaitMs: number = MAX
       return {
         content: [{
           type: "text",
-          text: `✅ Input executed in process ${pid}.\n📭 (No output produced)${statusMessage}${timingMessage}`
+          text: `✅ Input executed in process ${pid}.\n📭 (No output produced)${statusMessage}${archiveMessage}${timingMessage}`
         }],
         structuredContent,
       };
@@ -732,6 +769,10 @@ export async function interactWithProcess(args: unknown, maxWaitMs: number = MAX
 
     if (truncationMessage) {
       responseText += truncationMessage;
+    }
+
+    if (archiveMessage) {
+      responseText += archiveMessage;
     }
 
     if (timingMessage) {

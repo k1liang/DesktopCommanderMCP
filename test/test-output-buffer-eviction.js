@@ -8,9 +8,10 @@
  * checks how long the overflow takes to absorb.
  */
 import assert from 'assert';
+import { existsSync, rmSync, statSync } from 'node:fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { startProcess, interactWithProcess, forceTerminate } from '../dist/tools/improved-process-tools.js';
+import { startProcess, interactWithProcess, readProcessOutput, forceTerminate } from '../dist/tools/improved-process-tools.js';
 import { terminalManager, MAX_BUFFERED_OUTPUT_CHARS } from '../dist/terminal-manager.js';
 import { runIfMain } from './helpers/run-if-main.js';
 
@@ -32,6 +33,7 @@ async function testOverflowAbsorbedQuickly() {
   const started = await startProcess({ command: `node "${FAKE_REPL}"`, timeout_ms: 10000 });
   const pid = started.structuredContent?.pid;
   assert.ok(pid > 0, `start_process should start the fake REPL, got: ${started.content[0].text}`);
+  let archivePath;
   try {
     // Longest time the event loop was unavailable, sampled every 20ms
     let longestBlockMs = 0;
@@ -59,11 +61,22 @@ async function testOverflowAbsorbedQuickly() {
     console.log(`absorbed in ${absorbMs}ms, longest event-loop block ${longestBlockMs}ms, ${tail.evictedLines} lines evicted, ${tail.totalLines} retained`);
     assert.ok(absorbed(), 'all output should arrive');
     assert.ok(tail.evictedLines > 0, 'the buffer cap should have evicted lines');
+    archivePath = tail.archivedOutputPath;
+    assert.ok(archivePath, 'evicted output should be archived before leaving memory');
+    assert.ok(existsSync(archivePath), `archive should exist: ${archivePath}`);
+    assert.ok(statSync(archivePath).size > 0, 'archive should contain the evicted output');
+
+    const surfaced = await readProcessOutput({ pid, offset: -1, length: 1 });
+    assert.match(surfaced.content[0].text, /archived to /, 'read_process_output should surface the archive path');
+    assert.equal(surfaced.structuredContent?.archivedOutputPath, archivePath);
+    assert.equal(surfaced.structuredContent?.archiveError, null);
+
     assert.ok(absorbMs < MAX_ABSORB_MS,
       `evicting ${tail.evictedLines} lines should not stall the server: took ${absorbMs}ms (limit ${MAX_ABSORB_MS}ms)`);
-    console.log('ok: overflow absorbed without stalling');
+    console.log(`ok: overflow absorbed without stalling; evicted output archived at ${archivePath}`);
   } finally {
     await forceTerminate({ pid });
+    if (archivePath) rmSync(archivePath, { force: true });
   }
 }
 

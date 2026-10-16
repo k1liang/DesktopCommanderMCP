@@ -1,4 +1,7 @@
 import { spawn } from 'child_process';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { TerminalSession, CommandExecutionResult, ActiveSession, TimingInfo, OutputEvent } from './types.js';
 import { DEFAULT_COMMAND_TIMEOUT, MAX_PROCESS_WAIT_MS } from './config.js';
 import { configManager, type ServerConfig } from './config-manager.js';
@@ -72,7 +75,7 @@ interface CompletedSession {
 }
 
 /** The retained-output fields shared by active and completed sessions. */
-type OutputBuffer = Pick<ManagedSession, 'outputLines' | 'bufferedChars' | 'evictedLines' | 'evictedChars' | 'streams'>;
+type OutputBuffer = Pick<ManagedSession, 'outputLines' | 'bufferedChars' | 'evictedLines' | 'evictedChars' | 'archivedOutputPath' | 'archiveError' | 'streams'>;
 
 /**
  * A position in a session's output, absolute since process start (evicted
@@ -128,6 +131,7 @@ const MAX_LINE_CHARS = 1024 * 1024;                  // force-split longer lines
 const MAX_WAIT_OUTPUT_CHARS = 2 * 1024 * 1024;       // start_process wait buffer (the initial output it returns)
 const MAX_COMPLETED_SESSIONS = 2048;                 // global hard cap across all ChatGPT sessions
 const MAX_COMPLETED_BUFFERED_CHARS = 256 * 1024 * 1024; // global hard memory cap for completed output
+const PROCESS_OUTPUT_ARCHIVE_DIR = path.join(os.homedir(), '.claude-server-commander', 'process-output-archive');
 
 // Result type for paginated output reading
 export interface PaginatedOutputResult {
@@ -140,7 +144,10 @@ export interface PaginatedOutputResult {
   exitCode?: number | null;    // Exit code if completed
   signal?: NodeJS.Signals | null;  // Signal that ended it, if completed by one (exitCode is then null)
   runtimeMs?: number;          // Runtime in milliseconds (for completed processes)
-  evictedLines?: number;       // Lines dropped by the buffer cap; when > 0, line numbers are relative to the retained buffer
+  evictedLines?: number;       // Lines moved out of the in-memory buffer; retained-buffer line numbers start after these
+  evictedChars?: number;       // Joined character count moved out of memory
+  archivedOutputPath?: string; // Disk archive containing evicted complete lines, when archival succeeded
+  archiveError?: string;       // Archival failure; some evicted output may then be unrecoverable
 }
 
 export class TerminalManager {
@@ -568,6 +575,24 @@ export class TerminalManager {
     return this.deliveryTurn;
   }
 
+  private archiveEvictedLines(session: TerminalSession, lineCount: number): void {
+    if (lineCount <= 0) return;
+    try {
+      mkdirSync(PROCESS_OUTPUT_ARCHIVE_DIR, { recursive: true });
+      if (!session.archivedOutputPath) {
+        session.archivedOutputPath = path.join(
+          PROCESS_OUTPUT_ARCHIVE_DIR,
+          `process-${session.pid}-${session.startTime.getTime()}.log`,
+        );
+      }
+      const archived = session.outputLines.slice(0, lineCount).join('\n') + '\n';
+      appendFileSync(session.archivedOutputPath, archived, 'utf8');
+      session.archiveError = undefined;
+    } catch (error) {
+      session.archiveError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   /**
    * Append text to a session's line buffer
    * Handles partial lines and newline splitting
@@ -624,6 +649,7 @@ export class TerminalManager {
       evicted++;
     }
     if (evicted > 0) {
+      this.archiveEvictedLines(session, evicted);
       session.outputLines.splice(0, evicted);
       session.evictedLines += evicted;
       session.lastReadIndex = Math.max(0, session.lastReadIndex - evicted);
@@ -643,6 +669,9 @@ export class TerminalManager {
     if (session) {
       const result = this.readFromLineBuffer(session, offset, length, false, undefined);
       result.evictedLines = session.evictedLines;
+      result.evictedChars = session.evictedChars;
+      result.archivedOutputPath = session.archivedOutputPath;
+      result.archiveError = session.archiveError;
       return result;
     }
 
@@ -660,6 +689,9 @@ export class TerminalManager {
         runtimeMs
       );
       result.evictedLines = completedSession.session.evictedLines;
+      result.evictedChars = completedSession.session.evictedChars;
+      result.archivedOutputPath = completedSession.session.archivedOutputPath;
+      result.archiveError = completedSession.session.archiveError;
       result.signal = completedSession.signal;
       if (
         offset === 0 &&
@@ -842,14 +874,27 @@ export class TerminalManager {
    * has retained. Also checks completed sessions in case the process finished
    * between snapshot and poll.
    */
-  readOutputSince(pid: number, snapshot: OutputSnapshot): { output: string; next: OutputSnapshot } | null {
+  readOutputSince(pid: number, snapshot: OutputSnapshot): {
+    output: string;
+    next: OutputSnapshot;
+    archivedOutputPath?: string;
+    archivedCharsSinceSnapshot?: number;
+    archiveError?: string;
+  } | null {
     const buffer: OutputBuffer | undefined = this.sessions.get(pid) ?? this.completedSessions.get(pid)?.session;
     if (!buffer) {
       return null;
     }
+    const archivedCharsSinceSnapshot = Math.max(0, buffer.evictedChars - snapshot.totalChars);
     return {
       output: TerminalManager.outputSinceSnapshot(buffer, snapshot.totalChars),
-      next: TerminalManager.endOfOutput(buffer)
+      next: TerminalManager.endOfOutput(buffer),
+      ...(archivedCharsSinceSnapshot > 0 && buffer.archivedOutputPath
+        ? { archivedOutputPath: buffer.archivedOutputPath, archivedCharsSinceSnapshot }
+        : {}),
+      ...(archivedCharsSinceSnapshot > 0 && buffer.archiveError
+        ? { archiveError: buffer.archiveError, archivedCharsSinceSnapshot }
+        : {}),
     };
   }
 
