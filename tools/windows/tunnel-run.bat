@@ -21,7 +21,7 @@ if not defined TUNNEL_CLIENT_BIN (
 if not defined TUNNEL_PROFILE set "TUNNEL_PROFILE=desktop-commander"
 if not defined DC_RESILIENT_MCP_HOST set "DC_RESILIENT_MCP_HOST=127.0.0.1"
 if not defined DC_RESILIENT_MCP_PORT set "DC_RESILIENT_MCP_PORT=8765"
-if not defined TUNNEL_MCP_MAX_CONCURRENT_REQUESTS set "TUNNEL_MCP_MAX_CONCURRENT_REQUESTS=4"
+if not defined TUNNEL_MCP_MAX_CONCURRENT_REQUESTS set "TUNNEL_MCP_MAX_CONCURRENT_REQUESTS=8"
 if not exist "%TUNNEL_CLIENT_BIN%" (
     echo [ERROR] tunnel-client executable not found: %TUNNEL_CLIENT_BIN%
     exit /b 1

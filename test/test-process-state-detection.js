@@ -64,8 +64,12 @@ async function startFakeRepl(promptName) {
   const started = await startProcess({ command: `node "${FAKE_REPL}" ${promptName}`, timeout_ms: 10000 });
   const pid = started.structuredContent?.pid;
   assert.ok(pid > 0, `start_process should start the fake REPL, got: ${started.content[0].text}`);
-  assert.strictEqual(started.structuredContent.status, 'waiting_for_input',
-    `start_process should report the fake REPL's first prompt, got: ${started.content[0].text}`);
+  let initialText = '';
+  for (let i = 0; i < 10 && !initialText.includes(`Process ${pid} is waiting for input`); i++) {
+    initialText = (await readProcessOutput({ pid, timeout_ms: 500 })).content[0].text;
+  }
+  assert.ok(initialText.includes(`Process ${pid} is waiting for input`),
+    `read_process_output should observe the fake REPL's first prompt, got: ${initialText}`);
   return pid;
 }
 
@@ -173,7 +177,7 @@ async function testInteractionStateCheckCost() {
   const pid = await startFakeRepl('python');
   try {
     const eluBefore = performance.eventLoopUtilization();
-    const result = await interactWithProcess({ pid, input: `stream ${STREAM_LINES} 10 ${STREAM_MS}`, timeout_ms: 30000 });
+    const result = await interactWithProcess({ pid, input: `stream ${STREAM_LINES} 10 ${STREAM_MS}`, timeout_ms: 30000 }, STREAM_MS + 5000);
     const elu = performance.eventLoopUtilization(eluBefore);
     console.log(`event loop busy ${(elu.utilization * 100).toFixed(1)}% (${elu.active.toFixed(0)}ms of ${(elu.active + elu.idle).toFixed(0)}ms), status ${result.structuredContent.status}`);
     assert.ok(elu.utilization < MAX_STREAM_LOOP_BUSY,

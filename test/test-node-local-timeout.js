@@ -7,10 +7,10 @@
  * and a shorter session timeout never applied. A call's own timeout_ms still
  * wins over the session's.
  *
- * Either timeout is held to the wait ceiling every process wait has
- * (MAX_PROCESS_WAIT_MS, #447): the call waits for the script and answers only
- * when it ends, so a script allowed to run past the ceiling kept the call
- * waiting after the client had given up on it.
+ * node:local is a one-shot script rather than a resumable process poll. Its
+ * explicit/session timeout therefore remains authoritative: applying
+ * MAX_PROCESS_WAIT_MS would require killing the script, unlike regular process
+ * waits whose underlying process can continue after the MCP call returns.
  */
 import assert from 'assert';
 import { startProcess, interactWithProcess, forceTerminate, listSessions } from '../dist/tools/improved-process-tools.js';
@@ -84,16 +84,18 @@ async function testCallTimeoutWins() {
   }
 }
 
-async function testWaitCeiling() {
-  console.log(`\nTest: the ${CAP_MS}ms wait ceiling ends a script under a ${LONG_SESSION_TIMEOUT_MS}ms timeout`);
+async function testWaitCeilingDoesNotKillOneShotScript() {
+  console.log(`\nTest: the ${CAP_MS}ms resumable wait ceiling does not kill a node:local one-shot script`);
   const pid = await startNodeLocal(LONG_SESSION_TIMEOUT_MS);
+  const scriptMs = 2500;
   try {
-    // The session's timeout, then the call's own
+    // The session's timeout, then the call's own. Both outlive the script even
+    // though the test-only resumable wait ceiling is shorter.
     for (const own of [{}, { timeout_ms: LONG_SESSION_TIMEOUT_MS }]) {
-      const { result, text, ms } = await timed(interactWithProcess({ pid, input: script(SHORT_SCRIPT_MS), ...own }, CAP_MS));
-      assert(result.isError && text.startsWith('Execution failed') && ms < ENDED_WITHIN_MS,
-        `The ${CAP_MS}ms wait ceiling should end the script (${own.timeout_ms ? "the call's" : "the session's"} timeout: ${LONG_SESSION_TIMEOUT_MS}ms), got after ${ms}ms: ${JSON.stringify(text)}`);
-      console.log(`✓ Ended after ${ms}ms (${own.timeout_ms ? "the call's" : "the session's"} timeout)`);
+      const { result, text, ms } = await timed(interactWithProcess({ pid, input: script(scriptMs), ...own }, CAP_MS));
+      assert(!result.isError && text.trim() === 'done' && ms >= CAP_MS,
+        `node:local should ignore the ${CAP_MS}ms resumable wait ceiling (${own.timeout_ms ? "the call's" : "the session's"} timeout: ${LONG_SESSION_TIMEOUT_MS}ms), got after ${ms}ms: ${JSON.stringify(text)}`);
+      console.log(`✓ Finished after ${ms}ms (${own.timeout_ms ? "the call's" : "the session's"} timeout)`);
     }
   } finally {
     await forceTerminate({ pid });
@@ -101,7 +103,7 @@ async function testWaitCeiling() {
 }
 
 export default async function runTests() {
-  const tests = [testLongSessionTimeout, testShortSessionTimeout, testCallTimeoutWins, testWaitCeiling];
+  const tests = [testLongSessionTimeout, testShortSessionTimeout, testCallTimeoutWins, testWaitCeilingDoesNotKillOneShotScript];
   // Every case runs even after one fails
   const failures = [];
   for (const test of tests) {

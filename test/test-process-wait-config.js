@@ -19,7 +19,7 @@ import { MAX_PROCESS_WAIT_MS } from '../dist/config.js';
 import { getProcessWaitLimit } from '../dist/terminal-manager.js';
 import { getConfig, setConfigValue } from '../dist/tools/config.js';
 import { validatePath } from '../dist/tools/filesystem.js';
-import { startProcess, interactWithProcess, forceTerminate } from '../dist/tools/improved-process-tools.js';
+import { startProcess, readProcessOutput, interactWithProcess, forceTerminate } from '../dist/tools/improved-process-tools.js';
 import { runIfMain, skip } from './helpers/run-if-main.js';
 import { isTestHome } from './helpers/test-env.js';
 
@@ -40,7 +40,7 @@ async function testCeilingUnderClientTimeout() {
 
 async function testFixedCeiling() {
   console.log('\n--- Test 1: the wait ceiling is the fixed constant ---');
-  assert.strictEqual(MAX_PROCESS_WAIT_MS, 50000);
+  assert.strictEqual(MAX_PROCESS_WAIT_MS, 5000);
   assert.deepStrictEqual(getProcessWaitLimit(MAX_PROCESS_WAIT_MS * 5),
     { waitMs: MAX_PROCESS_WAIT_MS, capMs: MAX_PROCESS_WAIT_MS, capped: true });
   assert.deepStrictEqual(getProcessWaitLimit(1000),
@@ -105,16 +105,20 @@ async function testNullOnArrayFields() {
 }
 
 async function testCappedWaitAnswers() {
-  console.log('\n--- Test 4: a wait the ceiling ends answers as before ---');
-  // A small ceiling stands in for MAX_PROCESS_WAIT_MS so the test doesn't wait a minute
+  console.log('\n--- Test 4: blocking process polls release at the wait ceiling ---');
+  // A small ceiling stands in for MAX_PROCESS_WAIT_MS so the test stays fast.
   const CAP_MS = 300;
-  const started = await startProcess({ command: 'node -e "setTimeout(() => {}, 3000)"', timeout_ms: 5000 }, CAP_MS);
+  const started = await startProcess({ command: 'node -e "setTimeout(() => {}, 3000)"', timeout_ms: 5000 });
   const pid = started.structuredContent?.pid;
   assert.ok(pid > 0, `start_process should start node, got: ${started.content[0].text}`);
   try {
-    assert.strictEqual(started.structuredContent.waitCapped, true, started.content[0].text);
-    assert.ok(started.content[0].text.endsWith('\n⏳ Process is running. Use read_process_output to get more output.'),
-      `start_process should end with the old status line, got: ${started.content[0].text}`);
+    const began = Date.now();
+    const read = await readProcessOutput({ pid, timeout_ms: 5000 }, CAP_MS);
+    const elapsed = Date.now() - began;
+    assert.ok(elapsed >= CAP_MS - 75 && elapsed < CAP_MS + 1000,
+      `read_process_output should release at ~${CAP_MS}ms, took ${elapsed}ms: ${read.content[0].text}`);
+    assert.ok(!read.content[0].text.includes('Process completed'),
+      `the wait ceiling must not terminate the underlying process: ${read.content[0].text}`);
   } finally {
     await forceTerminate({ pid });
   }
@@ -123,6 +127,12 @@ async function testCappedWaitAnswers() {
   const replPid = repl.structuredContent?.pid;
   assert.ok(replPid > 0, `start_process should start the Node.js REPL, got: ${repl.content[0].text}`);
   try {
+    let promptText = '';
+    for (let i = 0; i < 10 && !promptText.includes('waiting for input'); i++) {
+      promptText = (await readProcessOutput({ pid: replPid, timeout_ms: 500 })).content[0].text;
+    }
+    assert.ok(promptText.includes('waiting for input'),
+      `the REPL prompt should be visible before interaction: ${promptText}`);
     const busy = await interactWithProcess(
       { pid: replPid, input: 'const t = Date.now(); while (Date.now() - t < 2000) {}', timeout_ms: 5000 }, CAP_MS);
     assert.strictEqual(busy.structuredContent.waitCapped, true, busy.content[0].text);
@@ -131,26 +141,26 @@ async function testCappedWaitAnswers() {
   } finally {
     await forceTerminate({ pid: replPid });
   }
-  console.log('ok: start_process and interact_with_process keep their old status lines');
+  console.log('ok: read_process_output and interact_with_process release at the wait ceiling');
 }
 
-async function testNodeLocalWaitsWithinTheCeiling() {
-  console.log('\n--- Test 5: a node:local call waits within the ceiling too ---');
-  // A small ceiling stands in for MAX_PROCESS_WAIT_MS; the script needs 6 s, the call allows 20 s
-  const CAP_MS = 1500;
-  const started = await startProcess({ command: 'node:local', timeout_ms: 20000 });
+async function testNodeLocalKeepsItsOwnTimeout() {
+  console.log('\n--- Test 5: node:local keeps its own timeout instead of the resumable wait ceiling ---');
+  // node:local is one-shot: a short resumable-process ceiling must not kill it.
+  const CAP_MS = 300;
+  const started = await startProcess({ command: 'node:local', timeout_ms: 3000 });
   const pid = Number(started.content[0].text.match(/PID (-?\d+)/)?.[1]);
   assert.ok(pid < 0, `start_process should start a node:local session, got: ${started.content[0].text}`);
   try {
     const result = await interactWithProcess(
-      { pid, input: "await new Promise((resolve) => setTimeout(resolve, 6000)); console.log('done');", timeout_ms: 20000 }, CAP_MS);
-    const text = result.content[0].text;
-    assert.ok(!text.includes('done'),
-      `a node:local script ran past the ${CAP_MS}ms wait ceiling (the call's timeout_ms was 20000) and answered: ${text}`);
+      { pid, input: "await new Promise((resolve) => setTimeout(resolve, 800)); console.log('done');", timeout_ms: 3000 }, CAP_MS);
+    assert.notStrictEqual(result.isError, true, result.content[0].text);
+    assert.strictEqual(result.content[0].text.trim(), 'done',
+      `node:local should finish under its explicit timeout even though maxWaitMs is ${CAP_MS}ms`);
   } finally {
     await forceTerminate({ pid });
   }
-  console.log('ok: a node:local script ends at the wait ceiling');
+  console.log('ok: node:local is not killed by the resumable process wait ceiling');
 }
 
 // The settings these tests change: they must be left as they were found
@@ -168,7 +178,7 @@ async function runAllTests() {
   await testNumberFields();
   await testNullOnArrayFields();
   await testCappedWaitAnswers();
-  await testNodeLocalWaitsWithinTheCeiling();
+  await testNodeLocalKeepsItsOwnTimeout();
   const after = await configManager.getConfig();
   for (const key of CHANGED_SETTINGS) {
     assert.deepStrictEqual(after[key], before[key],

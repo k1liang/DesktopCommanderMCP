@@ -12,12 +12,8 @@ export const TOOL_CALL_FILE_MAX_SIZE = 1024 * 1024 * 10; // 10 MB
 
 export const DEFAULT_COMMAND_TIMEOUT = 1000; // milliseconds
 
-// Longest one process call (start_process, interact_with_process,
-// read_process_output) blocks, whatever timeout_ms asks for; the process keeps
-// running and the caller reads the rest with read_process_output. It stays well
-// under 60 s: that is the MCP SDK's default request timeout
-// (DEFAULT_REQUEST_TIMEOUT_MSEC), which Claude Desktop and the remote device's
-// own client use, and an answer capped at 60 s arrived just after the client had
-// given up (-32001 "Request timed out", #447). The margin leaves time to build
-// and deliver the answer.
-export const MAX_PROCESS_WAIT_MS = 50000;
+// A process wait is a polling operation, not a lease on an MCP dispatcher slot.
+// Keep each call short so several long-running sessions cannot starve unrelated
+// MCP tools behind a shared tunnel-client concurrency pool. The process keeps
+// running and callers continue with read_process_output.
+export const MAX_PROCESS_WAIT_MS = 5000;

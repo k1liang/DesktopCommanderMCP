@@ -493,11 +493,11 @@ export async function interactWithProcess(args: unknown, maxWaitMs: number = MAX
       inputLength: input.length
     });
 
-    // Execute code via temp file approach
-    // Respect per-call timeout if provided, otherwise use session default
-    // (parsed.data's: timeout_ms above already holds the 8000ms default for processes),
-    // within the process wait ceiling: the call answers only once the script ends
-    const effectiveTimeout = Math.min(parsed.data.timeout_ms ?? session.timeout_ms, waitLimit.capMs);
+    // node:local is a one-shot script, not a resumable process poll: returning at
+    // MAX_PROCESS_WAIT_MS would require killing the script, unlike regular
+    // read/interact calls whose underlying process keeps running. Preserve the
+    // explicit call timeout when present, otherwise the session timeout.
+    const effectiveTimeout = parsed.data.timeout_ms ?? session.timeout_ms;
     return executeNodeCode(input, effectiveTimeout, pid);
   }
 
