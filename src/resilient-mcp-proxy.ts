@@ -767,11 +767,43 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+function logToolCallDuration(
+  message: JsonObject,
+  response: JsonObject | null,
+  startedAt: number,
+  active: number,
+  generation: number,
+  error?: unknown,
+): void {
+  if (message.method !== 'tools/call') return;
+
+  const toolName = String(message?.params?.name ?? 'unknown');
+  const durationMs = Date.now() - startedAt;
+  const outcome = error
+    ? 'exception'
+    : response?.error
+      ? 'rpc_error'
+      : response?.result?.isError === true
+        ? 'tool_error'
+        : 'ok';
+  const paged = response?.result?.structuredContent?.pagination?.has_more === true;
+  let responseBytes = 0;
+  try {
+    responseBytes = response ? Buffer.byteLength(JSON.stringify(response), 'utf8') : 0;
+  } catch {}
+
+  process.stderr.write(
+    `[resilient-mcp-proxy] INFO tools/call tool=${toolName} duration_ms=${durationMs} outcome=${outcome} ` +
+    `response_bytes=${responseBytes} paged=${paged} active=${active} generation=${generation}\n`,
+  );
+}
+
 export async function startResilientMcpProxy(options: ResilientMcpProxyOptions = {}) {
   const host = options.host ?? DEFAULT_HOST;
   const port = options.port ?? DEFAULT_PORT;
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const session = new ResilientChildMcpSession(options);
+  let activeToolCalls = 0;
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -819,8 +851,24 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
           continue;
         }
 
-        const response = await session.handle(message);
-        if (response) responses.push(response);
+        const toolCall = message.method === 'tools/call';
+        const startedAt = Date.now();
+        if (toolCall) activeToolCalls += 1;
+
+        try {
+          const response = await session.handle(message);
+          if (toolCall) {
+            logToolCallDuration(message, response, startedAt, activeToolCalls, session.childGeneration);
+          }
+          if (response) responses.push(response);
+        } catch (error) {
+          if (toolCall) {
+            logToolCallDuration(message, null, startedAt, activeToolCalls, session.childGeneration, error);
+          }
+          throw error;
+        } finally {
+          if (toolCall) activeToolCalls -= 1;
+        }
       }
 
       if (responses.length === 0) {
