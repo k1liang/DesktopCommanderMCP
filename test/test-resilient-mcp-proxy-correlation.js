@@ -213,6 +213,22 @@ async function run() {
     assert.ok(page.events[1].response_bytes > 0);
     cursor = page.next_after;
 
+    // 9. Explicit correlation marker carries the opaque coordinator token.
+    const correlationToken = 'gaifan-bind-0123456789abcdef';
+    await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'tools/call',
+      params: {
+        name: 'correlation_marker',
+        arguments: { token: correlationToken },
+      },
+    }, 'req-correlation-marker');
+    page = await getEvents(proxy, cursor);
+    assertPair(page.events, { requestId: 'req-correlation-marker', jsonrpcId: 11, toolName: 'correlation_marker' });
+    assert.ok(page.events.every(event => event.correlation_token === correlationToken));
+    cursor = page.next_after;
+
     // Bounded retention: overflow the ring and verify old cursors are marked truncated.
     for (let i = 0; i < 8; i += 1) {
       await post(proxy.url, {
@@ -235,7 +251,7 @@ async function run() {
     );
     assert.equal(badAfter.status, 400);
 
-    console.log('PASS: request correlation lifecycle acceptance matrix (8/8)');
+    console.log('PASS: request correlation lifecycle acceptance matrix (9/9)');
     return true;
   } finally {
     await proxy.close();

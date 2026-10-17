@@ -34,6 +34,7 @@ async function handle(message) {
           { name: 'ok', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true, idempotentHint: true } },
           { name: 'fail', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true, idempotentHint: true } },
           { name: 'large', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true, idempotentHint: true } },
+          { name: 'correlation_marker', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true, idempotentHint: true } },
         ],
       },
     });
@@ -77,6 +78,15 @@ async function handle(message) {
       jsonrpc: '2.0',
       id,
       result: { content: [{ type: 'text', text: 'x'.repeat(size) }] },
+    });
+    return;
+  }
+
+  if (name === 'correlation_marker') {
+    send({
+      jsonrpc: '2.0',
+      id,
+      result: { content: [{ type: 'text', text: String(args.token ?? '') }] },
     });
     return;
   }

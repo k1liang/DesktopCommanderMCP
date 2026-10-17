@@ -7,6 +7,10 @@ export const GetConfigArgsSchema = z.object({
   origin: z.enum(['ui', 'llm']).optional(),
 });
 
+export const CorrelationMarkerArgsSchema = z.object({
+  token: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]+$/),
+});
+
 export const SetConfigValueArgsSchema = z.object({
   key: z.string(),
   value: z.union([
@@ -250,6 +254,7 @@ export const TrackUiEventArgsSchema = z.object({
  */
 export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   get_config: GetConfigArgsSchema,
+  correlation_marker: CorrelationMarkerArgsSchema,
   set_config_value: SetConfigValueArgsSchema,
   read_file: ReadFileArgsSchema,
   read_multiple_files: ReadMultipleFilesArgsSchema,

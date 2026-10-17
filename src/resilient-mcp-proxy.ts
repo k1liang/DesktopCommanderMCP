@@ -72,6 +72,8 @@ type ToolLifecycleEvent = {
   started_at: string;
   pending_tool_calls: number;
   generation: number;
+  /** Opaque coordinator token emitted only by correlation_marker. */
+  correlation_token?: string;
   result_returned_at?: string;
   duration_ms?: number;
   outcome?: ToolLifecycleOutcome;
@@ -253,6 +255,7 @@ class ProxyDiagnostics {
     startedAt: number;
     pendingToolCalls: number;
     generation: number;
+    correlationToken?: string;
   }): void {
     const startedAt = new Date(meta.startedAt).toISOString();
     this.pushToolLifecycleEvent({
@@ -264,6 +267,7 @@ class ProxyDiagnostics {
       started_at: startedAt,
       pending_tool_calls: meta.pendingToolCalls,
       generation: meta.generation,
+      ...(meta.correlationToken ? { correlation_token: meta.correlationToken } : {}),
     });
   }
 
@@ -277,6 +281,7 @@ class ProxyDiagnostics {
     responseBytes: number;
     pendingToolCalls: number;
     generation: number;
+    correlationToken?: string;
   }): void {
     const completedAt = new Date(meta.completedAt).toISOString();
     this.pushToolLifecycleEvent({
@@ -292,6 +297,7 @@ class ProxyDiagnostics {
       response_bytes: meta.responseBytes,
       pending_tool_calls: meta.pendingToolCalls,
       generation: meta.generation,
+      ...(meta.correlationToken ? { correlation_token: meta.correlationToken } : {}),
     });
   }
 
@@ -1276,6 +1282,12 @@ function normalizeRequestIdHeader(req: IncomingMessage): string | null {
   return normalized || null;
 }
 
+function correlationTokenFromMessage(message: JsonObject): string | undefined {
+  if (message?.method !== 'tools/call' || message?.params?.name !== 'correlation_marker') return undefined;
+  const value = message?.params?.arguments?.token;
+  return typeof value === 'string' && /^[A-Za-z0-9._:-]{16,128}$/.test(value) ? value : undefined;
+}
+
 function parseNonNegativeInteger(value: string | null, fallback: number): number | null {
   if (value === null || value === '') return fallback;
   if (!/^\d+$/.test(value)) return null;
@@ -1405,6 +1417,7 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
         }
 
         const toolCall = message.method === 'tools/call';
+        const correlationToken = correlationTokenFromMessage(message);
         const startedAt = Date.now();
         let toolResponse: JsonObject | null = null;
         let toolError: unknown;
@@ -1417,6 +1430,7 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
             startedAt,
             pendingToolCalls: activeToolCalls,
             generation: session.childGeneration,
+            correlationToken,
           });
         }
 
@@ -1446,6 +1460,7 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
               responseBytes: responseByteLength(toolResponse),
               pendingToolCalls: activeToolCalls,
               generation: session.childGeneration,
+              correlationToken,
             });
           }
         }

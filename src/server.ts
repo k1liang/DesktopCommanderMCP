@@ -46,6 +46,7 @@ import {
     MoveFileArgsSchema,
     GetFileInfoArgsSchema,
     GetConfigArgsSchema,
+    CorrelationMarkerArgsSchema,
     SetConfigValueArgsSchema,
     ListProcessesArgsSchema,
     EditBlockArgsSchema,
@@ -332,6 +333,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     readOnlyHint: true,
                     openWorldHint: false,
                     destructiveHint: false,
+                },
+            },
+            {
+                name: "correlation_marker",
+                description: `
+                        Read-only correlation marker used only when an external coordinator explicitly asks
+                        this conversation to establish a caller-session binding. Returns the supplied opaque
+                        token unchanged and performs no file, process, network, configuration, or UI action.
+                        Do not call this tool unless the user or coordinator explicitly supplied a marker token.`,
+                inputSchema: zodToJsonSchema(CorrelationMarkerArgsSchema),
+                annotations: {
+                    title: "Correlation Marker",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    openWorldHint: false,
                 },
             },
             {
@@ -1270,6 +1286,14 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
                     };
                 }
                 break;
+            case "correlation_marker": {
+                const token = typeof (args as any)?.token === "string" ? (args as any).token : "";
+                result = {
+                    content: [{ type: "text", text: token }],
+                    structuredContent: { token },
+                };
+                break;
+            }
             case "set_config_value":
                 try {
                     result = await setConfigValue(args);
