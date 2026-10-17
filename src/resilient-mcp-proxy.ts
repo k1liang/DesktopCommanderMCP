@@ -21,6 +21,9 @@ const DEFAULT_SEARCH_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_STALL_THRESHOLD_MS = 1_500;
 const DEFAULT_MESSAGE_GAP_THRESHOLD_MS = 10_000;
 const DEFAULT_SEQUENCE_BLOCK_SIZE = 1_024n;
+const DEFAULT_TOOL_EVENT_MAX_ENTRIES = 2_048;
+const DEFAULT_TOOL_EVENT_PAGE_LIMIT = 200;
+const MAX_TOOL_EVENT_PAGE_LIMIT = 1_000;
 const DEFAULT_DIAGNOSTICS_DIR = path.join(os.homedir(), '.claude-server-commander', 'tunnel-diagnostics');
 const RESULT_PAGE_TOOL_NAME = 'get_result_page';
 
@@ -57,6 +60,26 @@ type MessageStamp = {
   previousTool: string | null;
 };
 
+type ToolLifecycleOutcome = 'success' | 'error' | 'canceled';
+type ToolLifecyclePhase = 'started' | 'completed';
+
+type ToolLifecycleEvent = {
+  version: 1;
+  seq: number;
+  request_id: string | null;
+  jsonrpc_id: JsonRpcId;
+  tool_name: string;
+  phase: ToolLifecyclePhase;
+  at: string;
+  started_at: string;
+  result_returned_at?: string;
+  duration_ms?: number;
+  outcome?: ToolLifecycleOutcome;
+  response_bytes?: number;
+  pending_tool_calls: number;
+  generation: number;
+};
+
 export type ResilientMcpProxyOptions = {
   host?: string;
   port?: number;
@@ -73,6 +96,7 @@ export type ResilientMcpProxyOptions = {
   messageGapThresholdMs?: number;
   diagnosticsDir?: string;
   sequenceBlockSize?: bigint;
+  toolEventMaxEntries?: number;
 };
 
 class ProxyDiagnostics {
@@ -80,6 +104,7 @@ class ProxyDiagnostics {
   readonly stallLogPath: string;
   readonly stallThresholdMs: number;
   readonly messageGapThresholdMs: number;
+  readonly toolEventMaxEntries: number;
 
   private readonly sequenceStatePath: string;
   private readonly sequenceBlockSize: bigint;
@@ -96,6 +121,9 @@ class ProxyDiagnostics {
   private lastCompletedToolName: string | null = null;
   private lastCompletedToolDurationMs: number | null = null;
   private lastStallSeq: bigint | null = null;
+  private toolEventLatestSeq = 0;
+  private toolEventHistoryEvicted = false;
+  private readonly toolEvents: ToolLifecycleEvent[] = [];
 
   constructor(options: ResilientMcpProxyOptions) {
     this.directory = options.diagnosticsDir ?? DEFAULT_DIAGNOSTICS_DIR;
@@ -103,6 +131,7 @@ class ProxyDiagnostics {
     this.sequenceStatePath = path.join(this.directory, 'message-sequence.txt');
     this.stallThresholdMs = Math.max(0, Math.floor(options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS));
     this.messageGapThresholdMs = Math.max(0, Math.floor(options.messageGapThresholdMs ?? DEFAULT_MESSAGE_GAP_THRESHOLD_MS));
+    this.toolEventMaxEntries = Math.max(1, Math.floor(options.toolEventMaxEntries ?? DEFAULT_TOOL_EVENT_MAX_ENTRIES));
     this.sequenceBlockSize = options.sequenceBlockSize && options.sequenceBlockSize > 0n
       ? options.sequenceBlockSize
       : DEFAULT_SEQUENCE_BLOCK_SIZE;
@@ -161,6 +190,34 @@ class ProxyDiagnostics {
       previousSeq,
       previousMethod,
       previousTool,
+    };
+  }
+
+  recordToolLifecycle(event: Omit<ToolLifecycleEvent, 'version'>): ToolLifecycleEvent {
+    const recorded: ToolLifecycleEvent = { version: 1, ...event };
+    this.toolEventLatestSeq = Math.max(this.toolEventLatestSeq, recorded.seq);
+    this.toolEvents.push(recorded);
+    if (this.toolEvents.length > this.toolEventMaxEntries) {
+      this.toolEventHistoryEvicted = true;
+      this.toolEvents.splice(0, this.toolEvents.length - this.toolEventMaxEntries);
+    }
+    return recorded;
+  }
+
+  getToolLifecyclePage(after: number, limit: number): JsonObject {
+    const oldestSeq = this.toolEvents[0]?.seq ?? null;
+    const latestSeq = this.toolEventLatestSeq;
+    const events = this.toolEvents.filter(event => event.seq > after).slice(0, limit);
+    const nextAfter = events.at(-1)?.seq ?? after;
+    return {
+      version: 1,
+      events,
+      oldest_seq: oldestSeq,
+      latest_seq: latestSeq,
+      next_after: nextAfter,
+      has_more: nextAfter < latestSeq,
+      truncated: oldestSeq !== null && (after === 0 ? this.toolEventHistoryEvicted : after < oldestSeq),
+      max_entries: this.toolEventMaxEntries,
     };
   }
 
@@ -1147,20 +1204,58 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+function normalizeInboundRequestId(req: IncomingMessage): string | null {
+  const raw = req.headers['x-request-id'];
+  const value = Array.isArray(raw) ? raw.find(item => item.trim().length > 0) : raw;
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function jsonRpcIdOf(message: JsonObject): JsonRpcId {
+  if (!Object.prototype.hasOwnProperty.call(message, 'id')) return null;
+  const id = message.id;
+  return typeof id === 'string' || typeof id === 'number' || id === null ? id : null;
+}
+
+function toolLifecycleOutcome(response: JsonObject | null, error?: unknown): ToolLifecycleOutcome {
+  if (error) {
+    const candidate = error as { name?: unknown; code?: unknown };
+    if (candidate?.name === 'AbortError' || candidate?.code === 'ABORT_ERR' || candidate?.code === 'ERR_CANCELED') {
+      return 'canceled';
+    }
+    return 'error';
+  }
+  return response?.error || response?.result?.isError === true ? 'error' : 'success';
+}
+
+function responseByteLength(response: JsonObject | null): number {
+  try {
+    return response ? Buffer.byteLength(JSON.stringify(response), 'utf8') : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function logToolCallDuration(
   diagnostics: ProxyDiagnostics,
   stamp: MessageStamp,
+  requestId: string | null,
   message: JsonObject,
   response: JsonObject | null,
   startedAt: number,
+  startedAtIso: string,
   active: number,
+  pendingAfter: number,
   generation: number,
   error?: unknown,
 ): void {
   if (message.method !== 'tools/call') return;
 
   const toolName = String(message?.params?.name ?? 'unknown');
-  const durationMs = Date.now() - startedAt;
+  const completedAt = Date.now();
+  const completedAtIso = new Date(completedAt).toISOString();
+  const durationMs = completedAt - startedAt;
   const outcome = error
     ? 'exception'
     : response?.error
@@ -1169,10 +1264,23 @@ function logToolCallDuration(
         ? 'tool_error'
         : 'ok';
   const paged = response?.result?.structuredContent?.pagination?.has_more === true;
-  let responseBytes = 0;
-  try {
-    responseBytes = response ? Buffer.byteLength(JSON.stringify(response), 'utf8') : 0;
-  } catch {}
+  const responseBytes = responseByteLength(response);
+
+  diagnostics.recordToolLifecycle({
+    seq: Number(stamp.seq * 2n + 1n),
+    request_id: requestId,
+    jsonrpc_id: jsonRpcIdOf(message),
+    tool_name: toolName,
+    phase: 'completed',
+    at: completedAtIso,
+    started_at: startedAtIso,
+    result_returned_at: completedAtIso,
+    duration_ms: durationMs,
+    outcome: toolLifecycleOutcome(response, error),
+    response_bytes: responseBytes,
+    pending_tool_calls: pendingAfter,
+    generation,
+  });
 
   diagnostics.recordToolCall({
     stamp,
@@ -1227,11 +1335,26 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
         }
       }
 
+      if (req.method === 'GET' && url.pathname === '/diagnostics/tool-events') {
+        const rawAfter = url.searchParams.get('after');
+        const rawLimit = url.searchParams.get('limit');
+        const after = rawAfter === null || rawAfter === '' ? 0 : Number(rawAfter);
+        const limit = rawLimit === null || rawLimit === '' ? DEFAULT_TOOL_EVENT_PAGE_LIMIT : Number(rawLimit);
+        if (!Number.isSafeInteger(after) || after < 0) {
+          return sendJson(res, 400, { error: 'after must be a non-negative safe integer' });
+        }
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_TOOL_EVENT_PAGE_LIMIT) {
+          return sendJson(res, 400, { error: `limit must be an integer between 1 and ${MAX_TOOL_EVENT_PAGE_LIMIT}` });
+        }
+        return sendJson(res, 200, diagnostics.getToolLifecyclePage(after, limit));
+      }
+
       if (req.method !== 'POST' || url.pathname !== '/mcp') {
         res.statusCode = 404;
         return res.end('not found');
       }
 
+      const requestId = normalizeInboundRequestId(req);
       const incoming = await readJsonBody(req, maxBodyBytes);
       const messages = Array.isArray(incoming) ? incoming : [incoming];
       const responses: JsonObject[] = [];
@@ -1246,17 +1369,54 @@ export async function startResilientMcpProxy(options: ResilientMcpProxyOptions =
 
         const toolCall = message.method === 'tools/call';
         const startedAt = Date.now();
-        if (toolCall) activeToolCalls += 1;
+        const startedAtIso = new Date(startedAt).toISOString();
+        if (toolCall) {
+          activeToolCalls += 1;
+          diagnostics.recordToolLifecycle({
+            seq: Number(stamp.seq * 2n),
+            request_id: requestId,
+            jsonrpc_id: jsonRpcIdOf(message),
+            tool_name: String(message?.params?.name ?? 'unknown'),
+            phase: 'started',
+            at: startedAtIso,
+            started_at: startedAtIso,
+            pending_tool_calls: activeToolCalls,
+            generation: session.childGeneration,
+          });
+        }
 
         try {
           const response = await session.handle(message);
           if (toolCall) {
-            logToolCallDuration(diagnostics, stamp, message, response, startedAt, activeToolCalls, session.childGeneration);
+            logToolCallDuration(
+              diagnostics,
+              stamp,
+              requestId,
+              message,
+              response,
+              startedAt,
+              startedAtIso,
+              activeToolCalls,
+              Math.max(0, activeToolCalls - 1),
+              session.childGeneration,
+            );
           }
           if (response) responses.push(response);
         } catch (error) {
           if (toolCall) {
-            logToolCallDuration(diagnostics, stamp, message, null, startedAt, activeToolCalls, session.childGeneration, error);
+            logToolCallDuration(
+              diagnostics,
+              stamp,
+              requestId,
+              message,
+              null,
+              startedAt,
+              startedAtIso,
+              activeToolCalls,
+              Math.max(0, activeToolCalls - 1),
+              session.childGeneration,
+              error,
+            );
           }
           throw error;
         } finally {
@@ -1336,6 +1496,9 @@ function parseCliArgs(argv: string[]): ResilientMcpProxyOptions {
     } else if (arg === '--result-page-bytes' && next) {
       options.resultPageBytes = Number(next);
       i += 1;
+    } else if (arg === '--tool-event-max-entries' && next) {
+      options.toolEventMaxEntries = Number(next);
+      i += 1;
     }
   }
 
@@ -1366,6 +1529,9 @@ if (entry === self) {
   }
   if (options.messageGapThresholdMs === undefined && process.env.DC_RESILIENT_MCP_GAP_MS) {
     options.messageGapThresholdMs = Number(process.env.DC_RESILIENT_MCP_GAP_MS);
+  }
+  if (options.toolEventMaxEntries === undefined && process.env.DC_RESILIENT_MCP_TOOL_EVENT_MAX_ENTRIES) {
+    options.toolEventMaxEntries = Number(process.env.DC_RESILIENT_MCP_TOOL_EVENT_MAX_ENTRIES);
   }
   if (!options.diagnosticsDir && process.env.DC_RESILIENT_MCP_DIAGNOSTICS_DIR) {
     options.diagnosticsDir = path.resolve(process.env.DC_RESILIENT_MCP_DIAGNOSTICS_DIR);
