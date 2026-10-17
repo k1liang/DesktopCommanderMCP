@@ -8,7 +8,7 @@ function workflowId(cmdRequestId) {
 }
 
 const WORKFLOW_EVENT_STAGES = new Map([
-  ['dispatcher forwarded command to MCP server', 'command_arrived'],
+  ['dispatcher received command from control plane', 'command_arrived'],
   ['dispatcher received terminal response from MCP server', 'mcp_final_received'],
   ['dispatcher posting terminal response to control plane', 'final_post_started'],
   ['dispatcher terminal response accepted by control plane', 'final_post_accepted'],
@@ -22,13 +22,17 @@ function lifecycleEvents(logPayload) {
       const attrs = event.attrs ?? {};
       const cmdRequestId = String(attrs.cmd_request_id ?? '');
       const workflow = workflowId(cmdRequestId);
-      const at = Date.parse(event.time);
+      const observedAt = Date.parse(event.time);
+      const polledAt = stage === 'command_arrived' ? Date.parse(attrs.polled_at ?? '') : NaN;
+      const at = Number.isFinite(polledAt) ? polledAt : observedAt;
       if (!workflow || !Number.isFinite(at)) return null;
       return {
         key: `${stage}|${event.time}|${cmdRequestId}|${attrs.request_id ?? ''}`,
         stage,
         at,
-        time: event.time,
+        time: Number.isFinite(polledAt) ? new Date(polledAt).toISOString() : event.time,
+        observedTime: event.time,
+        polledAt: Number.isFinite(polledAt) ? new Date(polledAt).toISOString() : null,
         workflow,
         cmdRequestId,
         requestId: attrs.request_id ?? null,
@@ -111,6 +115,8 @@ export class WorkflowStallTracker {
               previous_request_id: pendingFinal.requestId,
               next_cmd_request_id: event.cmdRequestId,
               next_request_id: event.requestId,
+              next_command_polled_time: event.polledAt,
+              next_command_observed_time: event.observedTime,
               post_final_gap_ms: postFinalGapMs,
             });
             if (pendingFinal.open) {
@@ -122,6 +128,8 @@ export class WorkflowStallTracker {
                 previous_cmd_request_id: pendingFinal.cmdRequestId,
                 previous_request_id: pendingFinal.requestId,
                 next_command_time: event.time,
+                next_command_polled_time: event.polledAt,
+                next_command_observed_time: event.observedTime,
                 next_cmd_request_id: event.cmdRequestId,
                 next_request_id: event.requestId,
                 post_final_gap_ms: postFinalGapMs,
