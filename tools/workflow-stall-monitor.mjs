@@ -25,13 +25,14 @@ function lifecycleEvents(logPayload) {
       const observedAt = Date.parse(event.time);
       const polledAt = stage === 'command_arrived' ? Date.parse(attrs.polled_at ?? '') : NaN;
       const at = Number.isFinite(polledAt) ? polledAt : observedAt;
-      if (!workflow || !Number.isFinite(at)) return null;
+      if (!workflow || !Number.isFinite(at) || !Number.isFinite(observedAt)) return null;
+      const observedTime = new Date(observedAt).toISOString();
       return {
-        key: `${stage}|${event.time}|${cmdRequestId}|${attrs.request_id ?? ''}`,
+        key: `${stage}|${observedTime}|${cmdRequestId}|${attrs.request_id ?? ''}`,
         stage,
         at,
-        time: Number.isFinite(polledAt) ? new Date(polledAt).toISOString() : event.time,
-        observedTime: event.time,
+        time: new Date(at).toISOString(),
+        observedTime,
         polledAt: Number.isFinite(polledAt) ? new Date(polledAt).toISOString() : null,
         workflow,
         cmdRequestId,

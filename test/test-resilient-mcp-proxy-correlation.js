@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,6 +59,7 @@ async function run() {
     diagnosticsDir,
     resultPageBytes: 2048,
     toolEventHistoryLimit: 12,
+    stallThresholdMs: 0,
   });
 
   let cursor = 0;
@@ -99,7 +100,7 @@ async function run() {
         jsonrpc: '2.0',
         id: 4,
         method: 'tools/call',
-        params: { name: 'ok', arguments: { delay_ms: 120, text: 'b' } },
+        params: { name: 'ok', arguments: { delay_ms: 10, text: 'b' } },
       }, 'req-concurrent-b'),
     ]);
     page = await getEvents(proxy, cursor);
@@ -109,6 +110,28 @@ async function run() {
     assert.deepEqual(
       new Set(page.events.filter(event => event.phase === 'completed').map(event => event.request_id)),
       new Set(['req-concurrent-a', 'req-concurrent-b']),
+    );
+
+    const stallEvents = (await readFile(proxy.diagnostics.stallLogPath, 'utf8'))
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    const concurrentStalls = stallEvents.filter(
+      event => event.kind === 'tool_stall' && (event.seq === '3' || event.seq === '4'),
+    );
+    assert.deepEqual(
+      concurrentStalls.map(event => event.seq),
+      ['4', '3'],
+      'stall log should preserve real completion order when concurrent calls finish out of arrival order',
+    );
+    const lateCompletion = concurrentStalls.find(event => event.seq === '3');
+    assert.equal(lateCompletion?.completion_out_of_order, true);
+    assert.equal(lateCompletion?.previous_stall_seq, '4');
+    assert.equal(lateCompletion?.messages_since_previous_stall, null);
+    assert.ok(
+      stallEvents.every(event => event.messages_since_previous_stall == null || BigInt(event.messages_since_previous_stall) >= 0n),
+      'stall sequence deltas must never become negative',
     );
     cursor = page.next_after;
 

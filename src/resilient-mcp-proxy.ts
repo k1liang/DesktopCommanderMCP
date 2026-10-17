@@ -216,8 +216,11 @@ class ProxyDiagnostics {
     if (meta.durationMs < this.stallThresholdMs) return;
 
     const previousStallSeq = this.lastStallSeq;
-    const messagesSincePreviousStall = previousStallSeq === null ? null : stamp.seq - previousStallSeq;
-    this.lastStallSeq = stamp.seq;
+    const completionOutOfOrder = previousStallSeq !== null && stamp.seq < previousStallSeq;
+    const messagesSincePreviousStall = previousStallSeq === null || completionOutOfOrder
+      ? null
+      : stamp.seq - previousStallSeq;
+    if (!completionOutOfOrder) this.lastStallSeq = stamp.seq;
     this.appendStallEvent({
       kind: 'tool_stall',
       time: new Date().toISOString(),
@@ -225,6 +228,7 @@ class ProxyDiagnostics {
       process_message_index: stamp.processIndex,
       previous_stall_seq: previousStallSeq?.toString() ?? null,
       messages_since_previous_stall: messagesSincePreviousStall?.toString() ?? null,
+      completion_out_of_order: completionOutOfOrder,
       since_previous_message_ms: stamp.sincePreviousMessageMs,
       previous_message_seq: stamp.previousSeq?.toString() ?? null,
       previous_message_method: stamp.previousMethod,
