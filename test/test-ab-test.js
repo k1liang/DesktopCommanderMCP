@@ -20,6 +20,7 @@ import {
   MCP_UI_HIDE_VARIANT,
   MCP_UI_SHOW_VARIANT,
   resolveMcpUiPreviewDecision,
+  shouldShowMcpUiPreviews,
 } from '../dist/utils/mcp-ui-ab-test.js';
 import { runIfMain } from './helpers/run-if-main.js';
 
@@ -258,6 +259,17 @@ async function runTests() {
     assert.strictEqual(MCP_UI_EXPERIMENT_NAME, 'McpUiPreviews');
     assert.strictEqual(MCP_UI_SHOW_VARIANT, 'showMCPUi');
     assert.strictEqual(MCP_UI_HIDE_VARIANT, 'notShowMCPUi');
+  });
+
+  await test('MCP UI can be disabled explicitly for tunnel clients', async () => {
+    const previous = process.env.DC_DISABLE_MCP_UI_PREVIEWS;
+    process.env.DC_DISABLE_MCP_UI_PREVIEWS = '1';
+    try {
+      assert.strictEqual(await shouldShowMcpUiPreviews(), false);
+    } finally {
+      if (previous === undefined) delete process.env.DC_DISABLE_MCP_UI_PREVIEWS;
+      else process.env.DC_DISABLE_MCP_UI_PREVIEWS = previous;
+    }
   });
 
   await test('MCP UI existing users without assignment are not enrolled', async () => {

@@ -21,6 +21,7 @@ fi
 TUNNEL_PROFILE="${TUNNEL_PROFILE:-desktop-commander}"
 DC_RESILIENT_MCP_HOST="${DC_RESILIENT_MCP_HOST:-127.0.0.1}"
 DC_RESILIENT_MCP_PORT="${DC_RESILIENT_MCP_PORT:-8765}"
+DC_DISABLE_MCP_UI_PREVIEWS="${DC_DISABLE_MCP_UI_PREVIEWS:-1}"
 [[ "$DC_RESILIENT_MCP_HOST" == "127.0.0.1" || "$DC_RESILIENT_MCP_HOST" == "localhost" ]] || { echo "[ERROR] Keep DC_RESILIENT_MCP_HOST on loopback; the local proxy has no HTTP authentication" >&2; exit 1; }
 
 command -v node >/dev/null || { echo "[ERROR] node not found in PATH" >&2; exit 1; }
@@ -29,7 +30,7 @@ if [[ ! -f "$REPO_DIR/dist/resilient-mcp-proxy.js" || ! -f "$REPO_DIR/dist/index
     (cd "$REPO_DIR" && npm run build)
 fi
 
-export CONTROL_PLANE_API_KEY CONTROL_PLANE_TUNNEL_ID DC_RESILIENT_MCP_HOST DC_RESILIENT_MCP_PORT
+export CONTROL_PLANE_API_KEY CONTROL_PLANE_TUNNEL_ID DC_RESILIENT_MCP_HOST DC_RESILIENT_MCP_PORT DC_DISABLE_MCP_UI_PREVIEWS
 export TUNNEL_RESILIENT_PROXY=1
 echo "[INFO] Starting resilient HTTP MCP proxy on $DC_RESILIENT_MCP_HOST:$DC_RESILIENT_MCP_PORT..."
 echo "[INFO] Starting tunnel profile $TUNNEL_PROFILE..."

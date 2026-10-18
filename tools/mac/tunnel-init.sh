@@ -13,6 +13,7 @@ source "$CONFIG"
 TUNNEL_PROFILE="${TUNNEL_PROFILE:-desktop-commander}"
 DC_RESILIENT_MCP_HOST="${DC_RESILIENT_MCP_HOST:-127.0.0.1}"
 DC_RESILIENT_MCP_PORT="${DC_RESILIENT_MCP_PORT:-8765}"
+DC_DISABLE_MCP_UI_PREVIEWS="${DC_DISABLE_MCP_UI_PREVIEWS:-1}"
 [[ "$DC_RESILIENT_MCP_HOST" == "127.0.0.1" || "$DC_RESILIENT_MCP_HOST" == "localhost" ]] || { echo "[ERROR] Keep DC_RESILIENT_MCP_HOST on loopback; the local proxy has no HTTP authentication" >&2; exit 1; }
 [[ -f "$TUNNEL_CLIENT_BIN" ]] || { echo "[ERROR] Full tunnel-client executable not found: $TUNNEL_CLIENT_BIN" >&2; exit 1; }
 chmod +x "$TUNNEL_CLIENT_BIN"
@@ -30,7 +31,7 @@ echo "[INFO] Building Desktop Commander..."
 (cd "$REPO_DIR" && npm run build)
 
 MCP_PROXY_URL="http://$DC_RESILIENT_MCP_HOST:$DC_RESILIENT_MCP_PORT/mcp"
-export CONTROL_PLANE_API_KEY CONTROL_PLANE_TUNNEL_ID DC_RESILIENT_MCP_HOST DC_RESILIENT_MCP_PORT
+export CONTROL_PLANE_API_KEY CONTROL_PLANE_TUNNEL_ID DC_RESILIENT_MCP_HOST DC_RESILIENT_MCP_PORT DC_DISABLE_MCP_UI_PREVIEWS
 
 echo "[INFO] Initializing tunnel profile $TUNNEL_PROFILE for resilient HTTP MCP proxy..."
 "$TUNNEL_CLIENT_BIN" init --force --sample sample_mcp_remote_no_auth --profile "$TUNNEL_PROFILE" --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" --mcp-server-url "$MCP_PROXY_URL" --health-listen-addr "127.0.0.1:0" "$@"

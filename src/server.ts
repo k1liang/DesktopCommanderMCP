@@ -119,11 +119,15 @@ export const server = new Server(
 // Add handler for resources/list method
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
     return {
-        resources: listUiResources(),
+        resources: await shouldShowMcpUiPreviews() ? listUiResources() : [],
     };
 });
 
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    if (!await shouldShowMcpUiPreviews()) {
+        throw new Error('MCP UI previews are disabled');
+    }
+
     const { uri } = request.params;
     const response = await readUiResource(uri);
     if (response) {
