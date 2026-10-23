@@ -6,11 +6,21 @@ CONFIG="$SCRIPT_DIR/tunnel.local.sh"
 [[ -f "$CONFIG" ]] || { echo "[ERROR] Missing $CONFIG (copy tunnel.local.sh.example)" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$CONFIG"
+
+TUNNEL_CLIENT_REPO="${TUNNEL_CLIENT_REPO:-$REPO_DIR/../tunnel-client}"
+TUNNEL_CLIENT_BIN="${TUNNEL_CLIENT_BIN:-$TUNNEL_CLIENT_REPO/bin/tunnel-client}"
+TUNNEL_RUN_BIN="${TUNNEL_CLIENT_RUN_BIN:-$TUNNEL_CLIENT_BIN}"
+
 : "${CONTROL_PLANE_API_KEY:?Set CONTROL_PLANE_API_KEY in tunnel.local.sh}"
 : "${CONTROL_PLANE_TUNNEL_ID:?Set CONTROL_PLANE_TUNNEL_ID in tunnel.local.sh}"
-TUNNEL_RUN_BIN="${TUNNEL_CLIENT_RUN_BIN:-${TUNNEL_CLIENT_BIN:-}}"
-[[ -n "$TUNNEL_RUN_BIN" ]] || { echo "[ERROR] Set TUNNEL_CLIENT_BIN or TUNNEL_CLIENT_RUN_BIN in tunnel.local.sh" >&2; exit 1; }
 [[ "$CONTROL_PLANE_API_KEY" != "PASTE_YOUR_RUNTIME_API_KEY_HERE" && "$CONTROL_PLANE_TUNNEL_ID" != "PASTE_YOUR_TUNNEL_ID_HERE" ]] || { echo "[ERROR] Replace credential placeholders in tunnel.local.sh" >&2; exit 1; }
+
+if [[ ! -f "$TUNNEL_RUN_BIN" && "$TUNNEL_RUN_BIN" == "$TUNNEL_CLIENT_BIN" && -f "$TUNNEL_CLIENT_REPO/Makefile" ]]; then
+    command -v go >/dev/null || { echo "[ERROR] go not found in PATH; required to build sibling tunnel-client" >&2; exit 1; }
+    command -v make >/dev/null || { echo "[ERROR] make not found in PATH; required to build sibling tunnel-client" >&2; exit 1; }
+    echo "[INFO] Building full tunnel-client from sibling repo: $TUNNEL_CLIENT_REPO"
+    (cd "$TUNNEL_CLIENT_REPO" && make tunnel-client)
+fi
 [[ -f "$TUNNEL_RUN_BIN" ]] || { echo "[ERROR] Tunnel executable not found: $TUNNEL_RUN_BIN" >&2; exit 1; }
 chmod +x "$TUNNEL_RUN_BIN"
 

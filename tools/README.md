@@ -25,9 +25,9 @@ macOS (from repository root):
     cp tools/mac/tunnel.local.sh.example tools/mac/tunnel.local.sh
     chmod +x tools/mac/*.sh
 
-Set your runtime API key, Tunnel ID, and **executable path** (TUNNEL_CLIENT_BIN) in the private file. Windows' currently configured credentials have already been migrated into the ignored tools/windows/tunnel.local.cmd on the local development machine.
+Set your runtime API key and Tunnel ID in the private file. Windows' currently configured credentials have already been migrated into the ignored tools/windows/tunnel.local.cmd on the local development machine.
 
-macOS special case: the v0.0.16 tunnel-client-runtime-cloudflared executable is run-only. Tunnel init requires the full macOS tunnel-client binary. Configure TUNNEL_CLIENT_BIN for init; the optional TUNNEL_CLIENT_RUN_BIN can point to the runtime-cloudflared binary. Do not assume that the runtime binary supports init.
+macOS defaults to the sibling source layout `<project>/DesktopCommanderMCP` + `<project>/tunnel-client`. If `../tunnel-client/bin/tunnel-client` does not exist, init/run automatically build it with `make tunnel-client`; this requires Go and make in PATH. `TUNNEL_CLIENT_REPO` / `TUNNEL_CLIENT_BIN` can still override the defaults. The optional `TUNNEL_CLIENT_RUN_BIN` may point to a run-only runtime-cloudflared build, but init always requires the full tunnel-client CLI.
 
 On Windows and macOS, Tunnel init points OpenAI Tunnel at a loopback HTTP MCP endpoint served by `dist/resilient-mcp-proxy.js`. The proxy owns the long-lived stdio child (`dist/index.js`), performs the legacy `initialize` → `notifications/initialized` handshake itself, and can recreate that child without exposing transient initialization failures to Tunnel. Use the full tunnel-client CLI for init; on macOS, the optional run-only runtime-cloudflared binary can still run the resulting HTTP profile.
 
@@ -44,8 +44,10 @@ macOS:
 
     ./tools/mac/start-remote-local.sh
     ./tools/mac/logout.sh
-    ./tools/mac/tunnel-init.sh
-    ./tools/mac/tunnel-run.sh
+    ./tools/mac/tunnel.sh init
+    ./tools/mac/tunnel.sh run
+
+The wrapper simply dispatches to `tunnel-init.sh` / `tunnel-run.sh`; those scripts remain directly callable.
 
 Tunnel init automatically runs `npm install` followed by `npm run build` from the repository root before creating the profile (and stops if either step fails). You do not need to run those commands manually before init. Tunnel init is a one-time operation; run starts the profile subsequently. Use separate Tunnel IDs on devices running simultaneously. Stop run with Ctrl+C.
 

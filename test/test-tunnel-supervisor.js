@@ -15,6 +15,7 @@ const windowsRun = fs.readFileSync(path.join(repo, 'tools', 'windows', 'tunnel-r
 const windowsInit = fs.readFileSync(path.join(repo, 'tools', 'windows', 'tunnel-init.bat'), 'utf8');
 const macRun = fs.readFileSync(path.join(repo, 'tools', 'mac', 'tunnel-run.sh'), 'utf8');
 const macInit = fs.readFileSync(path.join(repo, 'tools', 'mac', 'tunnel-init.sh'), 'utf8');
+const macWrapper = fs.readFileSync(path.join(repo, 'tools', 'mac', 'tunnel.sh'), 'utf8');
 
 assert.match(windowsRun, /TUNNEL_RESILIENT_PROXY=1/, 'Windows run script must enable the resilient HTTP proxy');
 assert.match(windowsRun, /tunnel-supervisor\.mjs/, 'Windows run script must launch tunnel-client through the supervisor');
@@ -35,6 +36,11 @@ assert.match(macInit, /--mcp-server-url/, 'Mac init must target the local HTTP p
 assert.match(macInit, /npm install[\s\S]*npm run build/, 'Mac init must install dependencies before building');
 assert.match(macInit, /init --force /, 'Mac init must replace the existing stdio profile');
 assert.match(macInit, /TUNNEL_SUPERVISOR_ONESHOT=1/, 'Mac init doctor must run through a one-shot proxy supervisor');
+assert.match(macInit, /REPO_DIR\/\.\.\/tunnel-client/, 'Mac init should default to the sibling tunnel-client source repo');
+assert.match(macInit, /make tunnel-client/, 'Mac init should build the sibling full tunnel-client when missing');
+assert.match(macRun, /make tunnel-client/, 'Mac run should recover a missing sibling full tunnel-client build');
+assert.match(macWrapper, /tunnel-init\.sh/, 'Mac wrapper must dispatch init');
+assert.match(macWrapper, /tunnel-run\.sh/, 'Mac wrapper must dispatch run');
 assert.match(supervisorSource, /WorkflowStallMonitor/, 'supervisor must enable per-workflow stall monitoring');
 assert.match(supervisorSource, /HEALTH_URL_FILE/, 'supervisor must publish tunnel health/admin URL for the workflow monitor');
 assert.match(supervisorSource, /workflow-stalls\.jsonl/, 'supervisor must persist workflow stall diagnostics');
