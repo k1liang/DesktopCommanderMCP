@@ -5,7 +5,7 @@ import { capture } from "../utils/capture.js";
 import { ServerResult } from '../types.js';
 import { analyzeProcessState, cleanProcessOutput, formatProcessStateMessage, ProcessState } from '../utils/process-detection.js';
 import { configManager } from '../config-manager.js';
-import { getDefaultShell } from '../utils/shell.js';
+import { getCommandEnvironment, getDefaultShell } from '../utils/shell.js';
 import { terminateProcessTree } from '../utils/process-tree.js';
 import { MAX_PROCESS_WAIT_MS } from '../config.js';
 import { DEFAULT_FILE_READ_LINE_LIMIT } from '../config-field-definitions.js';
@@ -47,6 +47,7 @@ async function executeNodeCode(code: string, timeout_ms: number = 30000, session
     const result = await new Promise<{ stdout: string; stderr: string; exitCode: number; treeSurvived?: boolean }>((resolve) => {
       const proc = spawn(process.execPath, [tempFile], {
         cwd: mcpRoot,
+        env: getCommandEnvironment(),
         windowsHide: true  // Prevent visible console windows on Windows
       });
 
