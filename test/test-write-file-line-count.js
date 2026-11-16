@@ -43,7 +43,7 @@ export default async function runTests() {
 
     const overLimit = await write('over-limit.txt', numbered(limit + 1).join('\n') + '\n');
     check(
-      overLimit.includes(`(${limit + 1} lines)`) && overLimit.includes('Performance tip'),
+      overLimit.includes(`(${limit + 1} lines)`) && overLimit.includes('Note: Write exceeded the ' + limit + '-line warning threshold'),
       `${limit + 1} lines ending in a newline: "(${limit + 1} lines)" and the performance note, got ${JSON.stringify(overLimit.slice(0, 90))}`
     );
 

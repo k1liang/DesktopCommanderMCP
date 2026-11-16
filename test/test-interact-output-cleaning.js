@@ -29,7 +29,7 @@
  */
 import assert from 'assert';
 import { cleanProcessOutput } from '../dist/utils/process-detection.js';
-import { startProcess, interactWithProcess, forceTerminate } from '../dist/tools/improved-process-tools.js';
+import { startProcess, readProcessOutput, interactWithProcess, forceTerminate } from '../dist/tools/improved-process-tools.js';
 import { WINDOWS_SHELL_PROMPTS } from './fixtures/windows-shell-prompts.js';
 import { NODE_24_SESSIONS } from './fixtures/node-repl-prompts.js';
 import { runIfMain } from './helpers/run-if-main.js';
@@ -41,6 +41,19 @@ const PS_PROMPT = captured('powershell.exe -NoLogo, at start');
 const CMD_PROMPT = captured('cmd.exe, at start').split('\n').pop();
 
 // [what, output since the input was sent, input, what the call returns, whether the input was read at a prompt (default: yes)]
+async function readUntilPrompt(pid, timeoutMs, name) {
+  const deadline = Date.now() + timeoutMs;
+  let output = '';
+  while (Date.now() < deadline) {
+    const result = await readProcessOutput({
+      pid,
+      timeout_ms: Math.max(1, Math.min(1_000, deadline - Date.now())),
+    });
+    output += result.content.map((part) => part.text ?? '').join('\n') + '\n';
+    if (output.includes('waiting for input')) return output;
+  }
+  throw new Error(name + ' did not reach a prompt: ' + output.slice(-300));
+}
 const CASES = [
   ['node -i answering a literal', '10\n> ', '10', '10'],
   ['node -i answering a string literal', "'abc'\n> ", "'abc'", "'abc'"],
@@ -65,6 +78,9 @@ const CASES = [
   ['python -i printing lines that start like prompts', '+ a\n> b\n>>> c\n>>> ', "print('+ a\\n> b\\n>>> c')", '+ a\n> b\n>>> c'],
   ['a diff from a shell reading commands without a prompt', 'diff --git a/f b/f\n+added\n+ added\n-removed\n', 'git diff', 'diff --git a/f b/f\n+added\n+ added\n-removed', false],
   ['bash -i tracing a command (set -x)', '+ echo hi\nhi\n$ ', 'echo hi', '+ echo hi\nhi\n$'],
+  // Program stderr can match a later input line; it remains output, even beside shell prompts.
+  ['bash -i printing a later silent command to stderr', 'bash-5.2$ a\ntrue\nbash-5.2$ ', "printf 'a\\ntrue\\n' >&2\ntrue", 'bash-5.2$ a\ntrue\nbash-5.2$', true],
+  ['bash -i printing a later command to stderr', 'bash-5.2$ echo b\nbash-5.2$ b\nbash-5.2$ ', "printf 'echo b\\n' >&2\necho b", 'bash-5.2$ echo b\nbash-5.2$ b\nbash-5.2$'],
   // Prompts where the REPL printed them
   ['python -i, both prompts after the results', '1\n2\n>>> >>> ', '1\n2', '1\n2'],
   ['python -i, the prompts before the result', '>>> >>> 5\n', 'x = 5\nx', '5'],
@@ -100,6 +116,7 @@ async function testNodeRepl() {
   const pid = started.structuredContent?.pid;
   assert(pid > 0, `start_process should start the Node.js REPL, got: ${started.content[0].text}`);
   try {
+    await readUntilPrompt(pid, 10_000, 'Node REPL');
     // The answer to the first line always; the call may answer at the prompt before the second
     for (const [input, answer, rest] of [['10', '10', ''], ["'abc'", "'abc'", ''], ['1\n2', '1', '\n2'],
       ["console.log('+ a\\n> b')", '+ a\n> b\nundefined', '']]) {
@@ -129,16 +146,17 @@ async function testNoPrompt() {
 }
 
 // A real shell session: PowerShell on Windows, bash on macOS and Linux (the pwsh preinstalled on GitHub's Ubuntu
-// runner wraps its prompt in terminal codes). Its output for "echo a" and "echo b", up to the next prompt; bash
-// writes its prompt to stderr, so the prompt it read "echo b" at arrives before or after "a".
+// runner wraps its prompt in terminal codes). --noediting disables Bash's input copies when reading from a pipe;
+// its prompts and program stderr remain intact. Its prompt can arrive before or after stdout's answer.
 async function testShell() {
   const [name, command, answer] = process.platform === 'win32'
     ? ['PowerShell', 'powershell -NoLogo', /📤 Output:\na\r?\n(b\r?\n)?PS /]
-    : ['bash', 'bash --norc --noprofile -i', /📤 Output:\n(bash-[\d.]+\$ )?a\n((bash-[\d.]+\$ )?b\n)?/];
+    : ['bash', 'bash --norc --noprofile --noediting -i', /📤 Output:\n(bash-[\d.]+\$ )?a\n((bash-[\d.]+\$ )?b\n)?/];
   console.log(`\n--- interact_with_process in a real ${name} session: two lines ---`);
   const started = await startProcess({ command, timeout_ms: 10_000 });
   const pid = started.structuredContent?.pid;
   try {
+    await readUntilPrompt(pid, 10_000, name);
     // It may answer at the prompt after the first line, before the second is read
     const result = await interactWithProcess({ pid, input: 'echo a\necho b', timeout_ms: 20_000 });
     const text = result.content[0].text;

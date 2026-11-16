@@ -22,7 +22,7 @@ import fs from 'fs';
 import { syncBuiltinESMExports } from 'module';
 import os from 'os';
 import path from 'path';
-import { startProcess } from '../dist/tools/improved-process-tools.js';
+import { startProcess, readProcessOutput, forceTerminate } from '../dist/tools/improved-process-tools.js';
 import { listProcesses } from '../dist/tools/process.js';
 import { getSystemInfo } from '../dist/utils/system-info.js';
 import { openBrowser } from '../dist/utils/open-browser.js';
@@ -59,17 +59,25 @@ async function runTests() {
   async function check(name, test) {
     try {
       await test();
-      console.log(`✓ ${name}`);
+      console.log(`鉁?${name}`);
     } catch (error) {
       failures.push(name);
-      console.error(`✗ ${name}: ${error.message}`);
+      console.error(`鉁?${name}: ${error.message}`);
     }
   }
 
   async function runsFromPath(shellArgs, what) {
-    const text = (await startProcess({ command: 'echo shell-ran', timeout_ms: 15000, ...shellArgs })).content[0].text;
-    assert.ok(text.includes('shell-ran') && !text.includes('bad option'),
-      `a ${what} in the server's working folder ran instead of the real shell; the answer: ${JSON.stringify(text.slice(0, 300))}`);
+    const started = await startProcess({ command: 'echo shell-ran', timeout_ms: 15000, ...shellArgs });
+    const pid = started.structuredContent?.pid;
+    assert(Number.isInteger(pid) && pid > 0, 'start_process should return a PID: ' + started.content[0].text);
+    try {
+      const output = await readProcessOutput({ pid, timeout_ms: 15000 });
+      const text = output.content[0].text;
+      assert.ok(text.includes('shell-ran') && !text.includes('bad option'),
+        'a ' + what + ' in the server working folder ran instead of the real shell; answer: ' + JSON.stringify(text.slice(0, 300)));
+    } finally {
+      await forceTerminate({ pid });
+    }
   }
 
   process.chdir(dir);
@@ -114,7 +122,7 @@ async function runTests() {
   }
 
   assert.strictEqual(failures.length, 0, `${failures.length} program lookup check(s) failed: ${failures.join('; ')}`);
-  console.log('✅ programs start from PATH, not from the working folder');
+  console.log('鉁?programs start from PATH, not from the working folder');
 }
 
 runIfMain(import.meta.url, runTests);

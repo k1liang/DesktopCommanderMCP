@@ -65,3 +65,6 @@ test_search.js
 # Private Tunnel credentials, tunnel ID and executable paths
 /tools/windows/tunnel.local.cmd
 /tools/mac/tunnel.local.sh
+
+# Test reports: junit.xml, results.json, results.tap per runner
+test-results/

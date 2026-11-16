@@ -15,11 +15,13 @@ const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 export default async function runTests() {
   // A fast repro (well under a second), named by its path from the repository root
   const script = path.join('test', 'repro', 'test-env-threadpool-timing.js');
+  const env = { ...process.env };
+  delete env.UV_THREADPOOL_SIZE;
   const result = spawnSync(process.execPath, [path.join('test', 'repro', 'run-repro.js'), script], {
     cwd: PROJECT_ROOT,
     encoding: 'utf8',
     timeout: 120_000,
-  });
+      env,});
   const output = `${result.stdout}${result.stderr}`;
   try {
     assert.strictEqual(result.status, 0, `run-repro.js ${script} exited ${result.status}: ${output.split('\n').filter((line) => /Cannot find module|✗|✓/.test(line)).join(' | ')}`);

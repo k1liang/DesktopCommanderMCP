@@ -22,11 +22,16 @@ export default async function runTests() {
   const integration = new DesktopCommanderIntegration();
   try {
     await integration.initialize();
-    const result = await integration.callClientTool('start_process', {
+    const started = await integration.callClientTool('start_process', {
       command: `node -e "console.log([process.env.${MARKER}, process.env.DC_REMOTE_DEVICE].join('/'))"`,
       timeout_ms: 10000,
     });
-    const text = result.content?.[0]?.text ?? '';
+    const startText = started.content?.[0]?.text ?? String(started);
+    const pid = Number(/Process started with PID (-?\d+)/.exec(startText)?.[1]);
+    assert(Number.isInteger(pid) && pid > 0,
+      `the device local server should start the command and return its PID, got: ${JSON.stringify(started)}`);
+    const result = await integration.callClientTool('read_process_output', { pid, timeout_ms: 10000 });
+    const text = result.content?.[0]?.text ?? String(result);
     assert(text.includes('set-for-the-device/true'),
       `a command on the device's local server should see the device's ${MARKER} (and DC_REMOTE_DEVICE=true), got:\n${text}`);
     console.log('✓ the local server and its commands get the device\'s environment');

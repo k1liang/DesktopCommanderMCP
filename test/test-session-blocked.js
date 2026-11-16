@@ -17,6 +17,16 @@ async function listed(pid) {
   return { isBlocked: session.isBlocked, line };
 }
 
+async function waitUntilBlocked(pid, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let current;
+  do {
+    current = await listed(pid);
+    if (current.isBlocked) return current;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  return current;
+}
 async function testRunningProcessNotBlocked() {
   console.log('\nTest: a running process that asks for nothing is not blocked');
   const started = await startProcess({ command: 'node -e "setTimeout(() => {}, 60000)"', timeout_ms: 500 });
@@ -27,7 +37,7 @@ async function testRunningProcessNotBlocked() {
     const { isBlocked, line } = await listed(pid);
     assert(isBlocked === false && line.includes('Blocked: false'),
       `a process sleeping without a prompt is not waiting for input, list_sessions says: ${line}`);
-    console.log(`✓ ${line}`);
+    console.log(`鉁?${line}`);
   } finally {
     await forceTerminate({ pid });
   }
@@ -39,10 +49,10 @@ async function testReplAtPromptBlocked() {
   const pid = started.structuredContent?.pid;
   assert(pid > 0, `start_process should start the Node.js REPL, got: ${started.content[0].text}`);
   try {
-    assert.strictEqual(started.structuredContent.status, 'waiting_for_input', started.content[0].text);
-    const { isBlocked, line } = await listed(pid);
+    assert.strictEqual(started.structuredContent.status, 'running', started.content[0].text);
+    const { isBlocked, line } = await waitUntilBlocked(pid);
     assert(isBlocked === true && line.includes('Blocked: true'), `a REPL at its prompt is waiting for input, list_sessions says: ${line}`);
-    console.log(`✓ ${line}`);
+    console.log(`鉁?${line}`);
   } finally {
     await forceTerminate({ pid });
   }
@@ -57,11 +67,11 @@ export default async function runTests() {
       await test();
     } catch (error) {
       failures.push(test.name);
-      console.error(`✗ ${test.name}: ${error.message}`);
+      console.error(`鉁?${test.name}: ${error.message}`);
     }
   }
   assert.deepStrictEqual(failures, [], `${failures.length} of ${tests.length} list_sessions Blocked tests failed`);
-  console.log('\n✅ list_sessions Blocked tests passed');
+  console.log('\n鉁?list_sessions Blocked tests passed');
 }
 
 runIfMain(import.meta.url, runTests);

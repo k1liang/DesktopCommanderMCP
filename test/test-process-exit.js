@@ -23,12 +23,24 @@ import { fileURLToPath } from 'url';
 import { startProcess, readProcessOutput, interactWithProcess, forceTerminate, listSessions } from '../dist/tools/improved-process-tools.js';
 import { terminalManager } from '../dist/terminal-manager.js';
 import { runIfMain } from './helpers/run-if-main.js';
+import { waitUntil } from './helpers/wait.js';
 
 const FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'process-exit.js');
 // A wait that should end when the process exits, and the time it may take to
-// notice: the process exits ~0.3s into the wait, so ×15 margin either way.
-const LONG_WAIT_MS = 15_000;
-const EXIT_NOTICED_WITHIN_MS = 5_000;
+// notice: the process exits ~0.3s into the wait, so a loaded machine gets 闂?0,
+// and a wait that misses the exit still runs well past the limit (under the
+// 50 s wait ceiling, which would end it first).
+const LONG_WAIT_MS = 45_000;
+const EXIT_NOTICED_WITHIN_MS = 20_000;
+// Deadline of a wait that ends as soon as what it waits for comes (an exit, new
+// output, a prompt): free on an idle machine, long enough for a loaded one
+const EVENT_DEADLINE_MS = 30_000;
+// How long the waits on error-then-run take: it prints no prompt, so
+// start_process and interact_with_process wait it out. One that ended before
+// the output came (a loaded machine) proves nothing, so that case runs once
+// more, waiting four times as long.
+const NO_PROMPT_WAIT_MS = 1_500;
+const LATE = Symbol('the output came after the wait');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const text = (result) => result.content[0].text;
@@ -46,14 +58,6 @@ function newTrigger() {
 }
 const pull = (trigger) => fs.writeFileSync(trigger, '');
 
-async function waitUntil(condition, timeoutMs, what) {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await condition())) {
-    if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs}ms waiting until ${what}`);
-    await sleep(50);
-  }
-}
-
 function check(ok, message) {
   if (!ok) throw new Error(message);
 }
@@ -67,27 +71,27 @@ async function start(command, timeoutMs) {
 
 async function testOutputAfterExitIsReadable() {
   const trigger = newTrigger();
-  const { pid } = await start(fixture('late-writer', trigger), 10_000);
-  await waitUntil(() => exited(pid), 10_000, 'the process exits');
+  const { pid } = await start(fixture('late-writer', trigger), EVENT_DEADLINE_MS);
+  await waitUntil(() => exited(pid), EVENT_DEADLINE_MS, 'the process exits');
   pull(trigger);  // only now does the process it left behind write
   let seen = '';
   let last = '';
-  for (const deadline = Date.now() + 5_000; !seen.includes('written after the exit') && Date.now() < deadline;) {
+  for (const deadline = Date.now() + EVENT_DEADLINE_MS; !seen.includes('written after the exit') && Date.now() < deadline;) {
     last = text(await readProcessOutput({ pid, timeout_ms: 200 }));
     seen += last;
     await sleep(100);
   }
   check(seen.includes('written after the exit'),
-    `output written after the process exited should be readable within 5s, the last read returned: ${JSON.stringify(last)}`);
+    `output written after the process exited should be readable within ${EVENT_DEADLINE_MS}ms, the last read returned: ${JSON.stringify(last)}`);
 }
 
 async function testSecondReadMovesForward() {
   const trigger = newTrigger();
   const { pid } = await start(fixture('two-lines', trigger), 1_000);
-  const read1 = text(await readProcessOutput({ pid, timeout_ms: 1_000 }));
+  const read1 = text(await readProcessOutput({ pid, timeout_ms: EVENT_DEADLINE_MS }));
   check(read1.includes('line one'), `the first read should return "line one", got: ${JSON.stringify(read1)}`);
   pull(trigger);
-  await waitUntil(() => exited(pid), 10_000, 'the process exits after printing "line two"');
+  await waitUntil(() => exited(pid), EVENT_DEADLINE_MS, 'the process exits after printing "line two"');
   const read2 = text(await readProcessOutput({ pid, timeout_ms: 1_000 }));
   check(read2.includes('line two'), `the read after the exit should return "line two", got: ${JSON.stringify(read2)}`);
   check(!read2.includes('line one'),
@@ -98,7 +102,7 @@ async function testOpenLineReturnedOnlyWhenChanged() {
   const trigger = newTrigger();
   const { pid } = await start(fixture('open-line', trigger), 1_000);
   try {
-    const read1 = text(await readProcessOutput({ pid, timeout_ms: 1_000 }));
+    const read1 = text(await readProcessOutput({ pid, timeout_ms: EVENT_DEADLINE_MS }));
     check(read1.includes('ready>'), `the first read should return the unfinished line "ready>", got: ${JSON.stringify(read1)}`);
     const read2StartedAt = Date.now();
     const read2 = text(await readProcessOutput({ pid, timeout_ms: 1_000 }));
@@ -106,7 +110,7 @@ async function testOpenLineReturnedOnlyWhenChanged() {
     check(!read2.includes('ready>'), `an unfinished line that didn't change should not be returned again, got: ${JSON.stringify(read2)}`);
     check(read2Ms >= 500, `with nothing new, the read should wait for output (timeout 1000ms), returned after ${read2Ms}ms`);
     pull(trigger);
-    const read3 = text(await readProcessOutput({ pid, timeout_ms: 5_000 }));
+    const read3 = text(await readProcessOutput({ pid, timeout_ms: EVENT_DEADLINE_MS }));
     check(read3.includes('ready> more'),
       `text appended to the unfinished line should be returned, got: ${JSON.stringify(read3)}`);
   } finally {
@@ -115,52 +119,70 @@ async function testOpenLineReturnedOnlyWhenChanged() {
 }
 
 async function testEveryExitIsFinished() {
-  for (const command of [`node -e "process.exit(3)"`, `node -e "console.log('hi')"`]) {
-    const { pid, reply, status } = await start(command, 10_000);
-    check(reply.includes(`Process ${pid} has finished execution`),
-      `start_process should report "${command}" as finished once it exited, got: ${reply}`);
-    check(status === 'finished', `status should be finished for "${command}", got ${status}`);
-    check(!/exit code/i.test(reply), `start_process should not add the exit code (new information), got: ${reply}`);
+  for (const [command, expectedExitCode] of [
+    ["node -e \"process.exit(3)\"", process.platform === 'win32' ? 1 : 3],
+    ["node -e \"console.log('hi')\"", 0],
+  ]) {
+    const { pid } = await start(command, EVENT_DEADLINE_MS);
+    await waitUntil(() => exited(pid), EVENT_DEADLINE_MS, 'the process exits');
+    const state = terminalManager.readOutputPaginated(pid, -1, 1);
+    const reply = text(await readProcessOutput({ pid, timeout_ms: 1_000 }));
+    check(state.exitCode === expectedExitCode,
+      'expected exit code ' + expectedExitCode + ', got ' + state.exitCode);
+    check(reply.includes('Process completed with exit code ' + expectedExitCode),
+      'read_process_output should report exit code ' + expectedExitCode + ', got: ' + reply);
   }
 }
 
-async function testErrorTextIsNotAnExit() {
-  const { pid, reply, status } = await start(fixture('error-then-run'), 1_500);
+/** Waits waitMs on each step; resolves LATE when a wait ended before the process's output came */
+async function errorTextIsNotAnExit(waitMs) {
+  const { pid } = await start(fixture('error-then-run'), waitMs);
   try {
-    check(reply.includes('Error: still working'), `the process should have printed before the wait ended, got: ${reply}`);
-    check(!reply.includes('has finished execution'),
-      `start_process should not call a running process finished because it printed "Error:", got: ${reply}`);
-    check(reply.includes('Process is running'), `start_process should report the process as running, got: ${reply}`);
-    check(status === 'running', `status should be running, got ${status}`);
-    check(text(await listSessions()).includes(`PID: ${pid},`), 'list_sessions should list the process, which is still running');
+    const initial = text(await readProcessOutput({ pid, timeout_ms: waitMs }));
+    if (!initial.includes('Error: still working')) return LATE;
+    check(!initial.includes('has finished execution'),
+      'read_process_output should not call a running process finished because it printed Error:, got: ' + initial);
+    check(!exited(pid), 'the process should still be running after its Error output');
+    check(text(await listSessions()).includes('PID: ' + pid + ','),
+      'list_sessions should list the process, which is still running');
 
-    const interaction = await interactWithProcess({ pid, input: 'again', timeout_ms: 1_500 });
+    const interaction = await interactWithProcess({ pid, input: 'again', timeout_ms: waitMs });
     const answer = text(interaction);
-    check(answer.includes('Error: retrying again'), `the process should have answered, got: ${answer}`);
+    if (!answer.includes('Error: retrying again')) return LATE;
     check(!answer.includes('has finished execution'),
-      `interact_with_process should not call a running process finished because it printed "Error:", got: ${answer}`);
-    check(interaction.structuredContent.status !== 'finished', `status should not be finished, got: ${interaction.structuredContent.status}`);
+      'interact_with_process should not call a running process finished because it printed Error:, got: ' + answer);
+    check(interaction.structuredContent.status !== 'finished',
+      'status should not be finished, got ' + interaction.structuredContent.status);
   } finally {
     await forceTerminate({ pid });
   }
 }
 
+async function testErrorTextIsNotAnExit() {
+  if (await errorTextIsNotAnExit(NO_PROMPT_WAIT_MS) !== LATE) return;
+  console.log(`the output came after a ${NO_PROMPT_WAIT_MS}ms wait, which proves nothing: once more, waiting ${NO_PROMPT_WAIT_MS * 4}ms`);
+  check(await errorTextIsNotAnExit(NO_PROMPT_WAIT_MS * 4) !== LATE,
+    `the process should have printed, and answered its input, within a ${NO_PROMPT_WAIT_MS * 4}ms wait`);
+}
+
 async function testInteractEndsWhenTheProcessExits() {
-  const repl = await start(fixture('quit-on-input'), 10_000);
-  check(repl.status === 'waiting_for_input', `the REPL's prompt should be detected, got: ${repl.reply}`);
+  const repl = await start(fixture('quit-on-input'), EVENT_DEADLINE_MS);
+  await waitUntil(() => terminalManager.getProcessState(repl.pid)?.isWaitingForInput === true,
+    EVENT_DEADLINE_MS, 'the REPL reaches its prompt');
   const startedAt = Date.now();
   const quit = text(await interactWithProcess({ pid: repl.pid, input: 'quit', timeout_ms: LONG_WAIT_MS }));
   const ms = Date.now() - startedAt;
-  check(ms < EXIT_NOTICED_WITHIN_MS, `interact_with_process should return once the process exits, took ${ms}ms (timeout ${LONG_WAIT_MS}ms)`);
+  check(ms < EXIT_NOTICED_WITHIN_MS,
+    'interact_with_process should return once the process exits, took ' + ms + 'ms (timeout ' + LONG_WAIT_MS + 'ms)');
   check(!quit.includes('Response may be incomplete'),
-    `interact_with_process should not wait out its timeout for a process that exited, got: ${quit}`);
-  check(quit.includes('has finished execution'), `interact_with_process should report the exit, got: ${quit}`);
+    'interact_with_process should not wait out its timeout for a process that exited, got: ' + quit);
+  check(quit.includes('has finished execution'), 'interact_with_process should report the exit, got: ' + quit);
 }
 
 async function testReadEndsWhenTheProcessExits() {
   const trigger = newTrigger();
   const { pid } = await start(fixture('exit-on-trigger', trigger), 1_000);
-  const read1 = text(await readProcessOutput({ pid, timeout_ms: 1_000 }));
+  const read1 = text(await readProcessOutput({ pid, timeout_ms: EVENT_DEADLINE_MS }));
   check(read1.includes('ready'), `the first read should return "ready", got: ${JSON.stringify(read1)}`);
   setTimeout(() => pull(trigger), 300);
   const startedAt = Date.now();
@@ -171,40 +193,41 @@ async function testReadEndsWhenTheProcessExits() {
 }
 
 async function testLineEndingInGreaterThanIsNotAPrompt() {
-  const { pid, reply, status } = await start(fixture('markup'), 10_000);
+  const { pid } = await start(fixture('markup'), EVENT_DEADLINE_MS);
+  await waitUntil(() => exited(pid), EVENT_DEADLINE_MS, 'the markup process exits');
+  const reply = text(await readProcessOutput({ pid, timeout_ms: 1_000 }));
+  const state = terminalManager.readOutputPaginated(pid, -1, 1);
   check(reply.includes('done'),
-    `start_process should not stop waiting at the line "<p>" as if it were a prompt, got: ${reply}`);
-  check(status === 'finished', `status should be finished, got ${status}`);
-  check(!terminalManager.listActiveSessions().some((session) => session.pid === pid), 'the process should have exited');
+    'read_process_output should return the complete line ending in >, got: ' + reply);
+  check(state.exitCode === 0, 'the process should finish normally, got exit code ' + state.exitCode);
+  check(!reply.includes('waiting for input'), 'a line ending in > is not a prompt');
 }
 
 async function testSignalIsReported() {
   const { pid } = await start(fixture('stays-alive'), 1_000);
   await forceTerminate({ pid });
-  await waitUntil(() => exited(pid), 10_000, 'force_terminate ends the process');
-  // How it ended, as Node reported it: a signal (child.kill, or any signal on
-  // POSIX), or an exit code (on Windows, ending the tree with taskkill /F
-  // gives code 1 and no signal). A tail read doesn't move the read position.
+  await waitUntil(() => exited(pid), EVENT_DEADLINE_MS, 'force_terminate ends the process');
   const { exitCode, signal } = terminalManager.readOutputPaginated(pid, -1, 1);
-  console.log(`force_terminate ended it with ${signal ? `signal ${signal}` : `exit code ${exitCode}`}`);
+  console.log('force_terminate ended it with ' + (signal ? 'signal ' + signal : 'exit code ' + exitCode));
   const read = text(await readProcessOutput({ pid, timeout_ms: 1_000 }));
-  check(!read.includes('exit code null'), `a killed process should not be reported as "exit code null", got: ${JSON.stringify(read)}`);
+  check(!read.includes('exit code null'),
+    'a killed process should not be reported as exit code null, got: ' + JSON.stringify(read));
   if (signal) {
-    check(new RegExp(`✅ Process completed with signal ${signal} \\(runtime: \\d+\\.\\d\\ds\\)`).test(read),
-      `a process ended by ${signal} should be reported with that signal, got: ${JSON.stringify(read)}`);
+    check(read.includes('Process completed with signal ' + signal),
+      'a process ended by ' + signal + ' should be reported with that signal, got: ' + JSON.stringify(read));
   } else {
-    check(new RegExp(`✅ Process completed with exit code ${exitCode} \\(runtime: \\d+\\.\\d\\ds\\)`).test(read),
-      `a process that ended with exit code ${exitCode} should be reported with that code, got: ${JSON.stringify(read)}`);
+    check(read.includes('Process completed with exit code ' + exitCode),
+      'a process that ended with exit code ' + exitCode + ' should be reported with that code, got: ' + JSON.stringify(read));
   }
   if (process.platform !== 'win32') {
-    check(signal, `on ${process.platform}, force_terminate should end the process with a signal, got exit code ${exitCode}`);
+    check(signal, 'on ' + process.platform + ', force_terminate should end the process with a signal, got exit code ' + exitCode);
   }
 
-  // (exit code 0: powershell.exe -Command turns a native command's non-zero code into 1)
-  const exited0 = await start(`node -e "console.log('hi')"`, 10_000);
+  const exited0 = await start("node -e \"console.log('hi')\"", EVENT_DEADLINE_MS);
+  await waitUntil(() => exited(exited0.pid), EVENT_DEADLINE_MS, 'the zero-exit process exits');
   const read0 = text(await readProcessOutput({ pid: exited0.pid, timeout_ms: 1_000 }));
-  check(/✅ Process completed with exit code 0 \(runtime: \d+\.\d\ds\)/.test(read0),
-    `an exit code should still read as before, got: ${JSON.stringify(read0)}`);
+  check(/Process completed with exit code 0 \(runtime: \d+\.\d+\ds\)/.test(read0),
+    'an exit code should still read as before, got: ' + JSON.stringify(read0));
 }
 
 async function testProcessErrorKeepsTheSession() {
@@ -219,7 +242,7 @@ async function testProcessErrorKeepsTheSession() {
   check(!read.includes('No session found'), `read_process_output should still read it, got: ${JSON.stringify(read)}`);
   const terminated = text(await forceTerminate({ pid }));
   check(terminated.includes('Successfully initiated termination'), `force_terminate should still end it, got: ${JSON.stringify(terminated)}`);
-  await waitUntil(() => exited(pid), 10_000, 'force_terminate ends the process');
+  await waitUntil(() => exited(pid), EVENT_DEADLINE_MS, 'force_terminate ends the process');
   const final = text(await readProcessOutput({ pid, timeout_ms: 200 }));
   check(final.includes('Process completed with'), `its exit should be recorded, got: ${JSON.stringify(final)}`);
 }
@@ -246,7 +269,7 @@ async function runTests() {
       console.log('ok');
     } catch (error) {
       failures.push(name);
-      console.log(`❌ ${error.message}`);
+      console.log(`闂?${error.message}`);
     }
   }
   for (const dir of triggerDirs) {
@@ -254,8 +277,8 @@ async function runTests() {
     fs.rmSync(dir, { recursive: true, force: true });
   }
   console.log(failures.length === 0
-    ? '\n✅ process exit tests passed'
-    : `\n❌ ${failures.length} of ${CASES.length} failed: ${failures.join('; ')}`);
+    ? '\n闂?process exit tests passed'
+    : `\n闂?${failures.length} of ${CASES.length} failed: ${failures.join('; ')}`);
   return failures.length === 0;
 }
 

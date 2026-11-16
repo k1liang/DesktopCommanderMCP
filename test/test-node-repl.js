@@ -6,7 +6,7 @@
  */
 
 import assert from 'assert';
-import { startProcess, interactWithProcess, forceTerminate } from '../dist/tools/improved-process-tools.js';
+import { startProcess, readProcessOutput, interactWithProcess, forceTerminate } from '../dist/tools/improved-process-tools.js';
 import { runIfMain } from './helpers/run-if-main.js';
 
 // Colors for console output
@@ -34,6 +34,19 @@ const MULTILINE_CODE = [
  * Test Node.js REPL interaction through start_process / interact_with_process
  */
 async function testNodeREPL() {
+async function readUntilPrompt(pid, timeoutMs, name) {
+  const deadline = Date.now() + timeoutMs;
+  let output = '';
+  while (Date.now() < deadline) {
+    const result = await readProcessOutput({
+      pid,
+      timeout_ms: Math.max(1, Math.min(1_000, deadline - Date.now())),
+    });
+    output += result.content.map((part) => part.text ?? '').join('\n') + '\n';
+    if (output.includes('waiting for input')) return output;
+  }
+  throw new Error(name + ' did not reach a prompt: ' + output.slice(-300));
+}
   console.log(`${colors.blue}Node.js REPL test via MCP tools...${colors.reset}`);
 
   const started = await startProcess({ command: 'node -i', timeout_ms: 5000 });
@@ -42,6 +55,7 @@ async function testNodeREPL() {
   console.log(`${colors.green}✓ Started Node.js REPL with PID ${pid}${colors.reset}`);
 
   try {
+    await readUntilPrompt(pid, 10_000, 'Node REPL');
     // Single-line command
     const single = await interactWithProcess({
       pid,

@@ -44,6 +44,15 @@ async function settle() {
   for (let i = 0; i < 5; i++) await new Promise(r => setTimeout(r, 50));
 }
 
+async function waitForCommandOutput(result, timeoutMs) {
+  if (!(result.pid > 0)) return result;
+  const deadline = Date.now() + timeoutMs;
+  while (terminalManager.getSession(result.pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const captured = terminalManager.readOutputPaginated(result.pid, 0, 1000);
+  return { ...result, output: captured?.lines.join('\n') ?? '' };
+}
 async function testBogusShellDoesNotCrash() {
   const result = await terminalManager.executeCommand('echo hi', 3000, BOGUS_SHELL);
   await settle();
@@ -63,7 +72,8 @@ async function testBogusExecutableDoesNotCrash() {
   // executeCommand returns as soon as the shell exits; the long wait is for a
   // busy machine, where starting PowerShell alone can take more than 3 s.
   const BOGUS_COMMAND = 'this-command-does-not-exist-4f2a';
-  const result = await terminalManager.executeCommand(BOGUS_COMMAND, 30000);
+  const started = await terminalManager.executeCommand(BOGUS_COMMAND, 30000);
+  const result = await waitForCommandOutput(started, 30000);
   await settle();
 
   assert.strictEqual(uncaught, null,
@@ -75,7 +85,8 @@ async function testBogusExecutableDoesNotCrash() {
 }
 
 async function testHealthyCommandStillWorks() {
-  const result = await terminalManager.executeCommand('echo roundtrip-ok', 8000);
+  const started = await terminalManager.executeCommand('echo roundtrip-ok', 8000);
+  const result = await waitForCommandOutput(started, 8000);
   await settle();
 
   assert.strictEqual(uncaught, null, 'healthy command must not raise');

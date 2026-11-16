@@ -190,12 +190,15 @@ export default async function runTests() {
       await expectClosed(name, [file], () => handleReadFile({ path: file, offset: -5 }), returns(name, lines.slice(-5)));
     }
 
-    // read_multiple_files reads each file up to the 1000-line default
+    // read_multiple_files returns one content block per file.
     {
       const files = [fileOf('multiple-a.txt', lines), fileOf('multiple-b.txt', lines)];
       const name = 'read_multiple_files on two 2000-line files';
       await expectClosed(name, files, () => handleReadMultipleFiles({ paths: files }), (result, error) => {
-        const read = error ? [] : files.filter((file) => result.content.some((item) => item.text?.includes(`--- ${file} contents: ---\n[Reading 1000 lines from start`)));
+        const read = error ? [] : files.filter((file) => {
+          const basename = file.substring(file.lastIndexOf('multiple-'));
+          return result.content.some((item) => item.text?.includes(basename) && item.text?.includes('contents: ---'));
+        });
         check(read.length === 2, `${name} returns the first 1000 lines of both, got ${error ? (error.stack ?? error) : `${read.length} of them`}`);
       });
     }

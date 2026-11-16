@@ -35,6 +35,13 @@ async function callTool(client, name, args) {
   return result.content?.[0]?.text ?? '';
 }
 
+async function startAndRead(client, args) {
+  const started = await callTool(client, 'start_process', args);
+  const pid = Number(/Process started with PID (-?\d+)/.exec(started)?.[1]);
+  assert(Number.isInteger(pid) && pid > 0,
+    'start_process should return a PID: ' + started);
+  return callTool(client, 'read_process_output', { pid, timeout_ms: args.timeout_ms ?? 10_000 });
+}
 export default async function runTests() {
   if (process.platform !== 'win32') {
     return skip('#702: ProgramData and Windows OpenSSH are Windows-only');
@@ -45,7 +52,7 @@ export default async function runTests() {
     // By its full path: a Git for Windows ssh.exe first on PATH doesn't need ProgramData
     const ssh = path.join(process.env.SystemRoot, 'System32', 'OpenSSH', 'ssh.exe');
     if (fs.existsSync(ssh)) {
-      const version = await callTool(client, 'start_process', { command: `${ssh} -V`, timeout_ms: 10000 });
+      const version = await startAndRead(client, { command: ssh + ' -V', timeout_ms: 10000 });
       assert(version.includes('OpenSSH_for_Windows'),
         `ssh.exe -V through start_process should print its version, got:\n${version}`);
       console.log('✓ start_process: ssh.exe -V prints its version');
@@ -53,7 +60,7 @@ export default async function runTests() {
       skip(`#702: Windows OpenSSH is not installed (${ssh})`);
     }
 
-    const shown = await callTool(client, 'start_process', { command: 'cmd.exe /d /c echo ProgramData=[%ProgramData%]', timeout_ms: 10000 });
+    const shown = await startAndRead(client, { command: 'cmd.exe /d /c echo ProgramData=[%ProgramData%]', timeout_ms: 10000 });
     assert(PROGRAM_DATA.test(shown), `a command start_process runs should get ProgramData, got:\n${shown}`);
     console.log('✓ start_process: the command gets ProgramData');
 
