@@ -19,11 +19,17 @@ DC_RESILIENT_MCP_PORT="${DC_RESILIENT_MCP_PORT:-8765}"
 DC_DISABLE_MCP_UI_PREVIEWS="${DC_DISABLE_MCP_UI_PREVIEWS:-1}"
 [[ "$DC_RESILIENT_MCP_HOST" == "127.0.0.1" || "$DC_RESILIENT_MCP_HOST" == "localhost" ]] || { echo "[ERROR] Keep DC_RESILIENT_MCP_HOST on loopback; the local proxy has no HTTP authentication" >&2; exit 1; }
 
-if [[ ! -f "$TUNNEL_CLIENT_BIN" && -f "$TUNNEL_CLIENT_REPO/Makefile" ]]; then
+# init is the explicit upgrade/rebuild entrypoint: always rebuild the sibling
+# tunnel-client when using the standard repo binary path. A custom binary override
+# remains an explicit opt-out from building the sibling checkout.
+if [[ "$TUNNEL_CLIENT_BIN" == "$TUNNEL_CLIENT_REPO/bin/tunnel-client" ]]; then
+    [[ -f "$TUNNEL_CLIENT_REPO/Makefile" ]] || { echo "[ERROR] tunnel-client Makefile not found: $TUNNEL_CLIENT_REPO/Makefile" >&2; exit 1; }
     command -v go >/dev/null || { echo "[ERROR] go not found in PATH; required to build sibling tunnel-client" >&2; exit 1; }
     command -v make >/dev/null || { echo "[ERROR] make not found in PATH; required to build sibling tunnel-client" >&2; exit 1; }
-    echo "[INFO] Building full tunnel-client from sibling repo: $TUNNEL_CLIENT_REPO"
+    echo "[INFO] Rebuilding full tunnel-client from sibling repo: $TUNNEL_CLIENT_REPO"
     (cd "$TUNNEL_CLIENT_REPO" && make tunnel-client)
+else
+    echo "[INFO] Using explicit TUNNEL_CLIENT_BIN override; skipping sibling tunnel-client build: $TUNNEL_CLIENT_BIN"
 fi
 [[ -f "$TUNNEL_CLIENT_BIN" ]] || { echo "[ERROR] Full tunnel-client executable not found: $TUNNEL_CLIENT_BIN" >&2; echo "[ERROR] Expected sibling source repo at: $TUNNEL_CLIENT_REPO" >&2; exit 1; }
 chmod +x "$TUNNEL_CLIENT_BIN"

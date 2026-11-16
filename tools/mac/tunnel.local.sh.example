@@ -7,7 +7,8 @@ CONTROL_PLANE_TUNNEL_ID="PASTE_YOUR_TUNNEL_ID_HERE"
 # Default layout:
 #   <project>/DesktopCommanderMCP
 #   <project>/tunnel-client
-# The init/run scripts automatically build <project>/tunnel-client/bin/tunnel-client if needed.
+# `tunnel.sh init` always rebuilds the sibling tunnel-client and DesktopCommanderMCP.
+# `tunnel.sh run` only builds missing artifacts; it does not force an upgrade rebuild.
 TUNNEL_CLIENT_REPO="${TUNNEL_CLIENT_REPO:-$REPO_DIR/../tunnel-client}"
 TUNNEL_CLIENT_BIN="${TUNNEL_CLIENT_BIN:-$TUNNEL_CLIENT_REPO/bin/tunnel-client}"
 
