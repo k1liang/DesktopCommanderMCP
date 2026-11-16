@@ -1,0 +1,2 @@
+tools/mac/*.sh text eol=lf
+tools/mac/*.sh.example text eol=lf

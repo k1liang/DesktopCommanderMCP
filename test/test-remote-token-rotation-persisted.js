@@ -39,13 +39,18 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { MCPDevice } from '../dist/remote-device/device.js';
+import { exitProcess } from '../dist/utils/exit-process.js';
 
 process.env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = '1';
 
 const DEVICE_ID = 'device-1';
 
-/** Cap on waiting for a write to land; far above any healthy save. */
-const PERSIST_DEADLINE_MS = 5000;
+/**
+ * Cap on waiting for a write to land; far above any healthy save, even on a
+ * loaded machine. The wait returns as soon as the write lands, so only a
+ * rotation that never reaches disk waits it out.
+ */
+const PERSIST_DEADLINE_MS = 30_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -105,6 +110,11 @@ async function makeDevice(configPath) {
     const device = new MCPDevice();
     device.deviceId = DEVICE_ID;
     device.configPath = configPath;
+    // A real device gets this only after validating /api/mcp-info.
+    device.trustedAuthContext = {
+      serverOrigin: 'https://mcp.desktopcommander.app',
+      supabaseUrl: 'https://olvbkozcufcbptfogatw.supabase.co',
+    };
 
     const client = makeFakeClient();
     const rc = device.remoteChannel;
@@ -185,6 +195,10 @@ await test('a restart loads the rotated token, not the one the process started w
     // A fresh process reading the same config file — what a restart does.
     const restarted = new MCPDevice();
     restarted.configPath = configPath;
+    restarted.trustedAuthContext = {
+      serverOrigin: 'https://mcp.desktopcommander.app',
+      supabaseUrl: 'https://olvbkozcufcbptfogatw.supabase.co',
+    };
     const loaded = await restarted.loadPersistedConfig();
 
     assert.ok(loaded, 'the restart must find a persisted session');
@@ -282,4 +296,4 @@ await test('a save with no session available does not wipe the token on disk', a
 });
 
 console.log(`\n${failures ? '🔴' : '✅'} remote token rotation persistence: ${failures} failing test(s).`);
-process.exit(failures ? 1 : 0);
+exitProcess(failures ? 1 : 0);

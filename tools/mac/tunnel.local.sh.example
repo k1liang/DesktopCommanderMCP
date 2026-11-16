@@ -1,0 +1,22 @@
+# Copy to tunnel.local.sh (ignored by Git). Never commit your real credentials.
+# OpenAI runtime API key (not a ChatGPT login password).
+CONTROL_PLANE_API_KEY="PASTE_YOUR_RUNTIME_API_KEY_HERE"
+# Tunnel ID created for this Mac. Do not run two devices with the same ID.
+CONTROL_PLANE_TUNNEL_ID="PASTE_YOUR_TUNNEL_ID_HERE"
+
+# Default layout:
+#   <project>/DesktopCommanderMCP
+#   <project>/tunnel-client
+# `tunnel.sh init` always rebuilds the sibling tunnel-client and DesktopCommanderMCP.
+# `tunnel.sh run` only builds missing artifacts; it does not force an upgrade rebuild.
+TUNNEL_CLIENT_REPO="${TUNNEL_CLIENT_REPO:-$REPO_DIR/../tunnel-client}"
+TUNNEL_CLIENT_BIN="${TUNNEL_CLIENT_BIN:-$TUNNEL_CLIENT_REPO/bin/tunnel-client}"
+
+# OPTIONAL: separate run executable, e.g. a prebuilt runtime-cloudflared binary.
+# TUNNEL_CLIENT_RUN_BIN="$TUNNEL_CLIENT_REPO/bin/tunnel-client-runtime-cloudflared"
+
+# Profile name shared by tunnel-init.sh and tunnel-run.sh.
+TUNNEL_PROFILE="desktop-commander"
+# Local resilient HTTP MCP proxy (loopback only).
+DC_RESILIENT_MCP_HOST="127.0.0.1"
+DC_RESILIENT_MCP_PORT="8765"

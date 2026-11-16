@@ -128,7 +128,8 @@ fs.writeFileSync(
 // Step 6b: Install dependencies in bundle directory
 console.log('📦 Installing production dependencies in bundle...');
 try {
-    execSync('npm install --omit=dev --production', { cwd: BUNDLE_DIR, stdio: 'inherit' });
+    // --install-links: file: dependencies as real files in the bundle, not links
+    execSync('npm install --omit=dev --production --install-links', { cwd: BUNDLE_DIR, stdio: 'inherit' });
     console.log('✅ Dependencies installed');
 } catch (error) {
     console.error('❌ Failed to install dependencies:', error.message);

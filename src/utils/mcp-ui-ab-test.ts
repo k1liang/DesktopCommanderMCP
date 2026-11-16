@@ -66,6 +66,10 @@ export async function resolveMcpUiPreviewDecision(deps: McpUiPreviewDecisionDeps
 }
 
 export async function shouldShowMcpUiPreviews(): Promise<boolean> {
+  if (process.env.DC_DISABLE_MCP_UI_PREVIEWS === '1') {
+    return false;
+  }
+
   return resolveMcpUiPreviewDecision({
     getExistingAssignment: () => configManager.getValue(`abTest_${MCP_UI_EXPERIMENT_NAME}`),
     isFirstRun: () => configManager.isFirstRun(),

@@ -1,0 +1,1 @@
+npx @wonderwhy-er/desktop-commander@latest remote --logout

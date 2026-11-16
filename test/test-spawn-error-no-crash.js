@@ -21,6 +21,7 @@
  */
 import assert from 'node:assert';
 import { terminalManager } from '../dist/terminal-manager.js';
+import { exitProcess } from '../dist/utils/exit-process.js';
 
 process.env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = '1';
 
@@ -29,14 +30,29 @@ const BOGUS_SHELL = process.platform === 'win32'
   ? '/usr/bin/definitely-not-a-shell'
   : '/definitely/not/a/shell';
 
+// Record crashes so each case can report them, and fail the file even if one
+// lands after the last check (a late crash is exactly what this test guards).
 let uncaught = null;
-process.on('uncaughtException', (err) => { uncaught = err; });
+process.on('uncaughtException', (err) => {
+  uncaught = err;
+  process.exitCode = 1;
+  console.error('✗ uncaught exception:', err.message);
+});
 
 /** Let the spawn 'error' event (next tick) and anything it triggers land. */
 async function settle() {
   for (let i = 0; i < 5; i++) await new Promise(r => setTimeout(r, 50));
 }
 
+async function waitForCommandOutput(result, timeoutMs) {
+  if (!(result.pid > 0)) return result;
+  const deadline = Date.now() + timeoutMs;
+  while (terminalManager.getSession(result.pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const captured = terminalManager.readOutputPaginated(result.pid, 0, 1000);
+  return { ...result, output: captured?.lines.join('\n') ?? '' };
+}
 async function testBogusShellDoesNotCrash() {
   const result = await terminalManager.executeCommand('echo hi', 3000, BOGUS_SHELL);
   await settle();
@@ -52,20 +68,25 @@ async function testBogusShellDoesNotCrash() {
 }
 
 async function testBogusExecutableDoesNotCrash() {
-  // No shell option: the command itself is the executable that fails to resolve.
-  const result = await terminalManager.executeCommand(
-    'this-command-does-not-exist-4f2a', 3000, false
-  );
+  // Runs through the default shell, which reports the unknown command itself.
+  // executeCommand returns as soon as the shell exits; the long wait is for a
+  // busy machine, where starting PowerShell alone can take more than 3 s.
+  const BOGUS_COMMAND = 'this-command-does-not-exist-4f2a';
+  const started = await terminalManager.executeCommand(BOGUS_COMMAND, 30000);
+  const result = await waitForCommandOutput(started, 30000);
   await settle();
 
   assert.strictEqual(uncaught, null,
     `spawn failure escaped as an uncaught exception: ${uncaught && uncaught.message}`);
-  assert.ok(result, 'executeCommand must return a result, not hang');
-  console.log('✓ bogus executable returns an error without crashing the process');
+  // Every shell's "not found" message names the command (bash, zsh, cmd, PowerShell)
+  assert.ok(result.output.includes(BOGUS_COMMAND),
+    `expected the shell's not-found error for ${BOGUS_COMMAND}, got ${JSON.stringify(result)}`);
+  console.log('✓ bogus executable returns the shell error without crashing the process');
 }
 
 async function testHealthyCommandStillWorks() {
-  const result = await terminalManager.executeCommand('echo roundtrip-ok', 8000);
+  const started = await terminalManager.executeCommand('echo roundtrip-ok', 8000);
+  const result = await waitForCommandOutput(started, 8000);
   await settle();
 
   assert.strictEqual(uncaught, null, 'healthy command must not raise');
@@ -83,7 +104,8 @@ async function main() {
   console.log('\nAll spawn-error tests passed.');
 }
 
-main().catch((err) => {
+// The uncaughtException handler above may have set the exit code already
+main().then(() => exitProcess(process.exitCode ?? 0)).catch((err) => {
   console.error('✗ FAILED:', err.message);
-  process.exit(1);
+  exitProcess(1);
 });

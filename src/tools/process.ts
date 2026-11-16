@@ -1,10 +1,14 @@
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import os from 'os';
 import { ProcessInfo, ServerResult } from '../types.js';
 import { KillProcessArgsSchema } from './schemas.js';
+import { resolveProgramPath } from '../utils/shell.js';
+import { terminatePid } from '../utils/process-tree.js';
+import { terminalManager } from '../terminal-manager.js';
+import { terminationFailedResult } from './improved-process-tools.js';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 /**
  * Parse `tasklist /FO CSV /NH` output (#662). Fields per row, all quoted:
@@ -51,9 +55,9 @@ export function parsePsAux(stdout: string): ProcessInfo[] {
 
 export async function listProcesses(): Promise<ServerResult> {
   const isWindows = os.platform() === 'win32';
-  const command = isWindows ? 'tasklist /FO CSV /NH' : 'ps aux';
+  const [program, args]: [string, string[]] = isWindows ? ['tasklist', ['/FO', 'CSV', '/NH']] : ['ps', ['aux']];
   try {
-    const { stdout } = await execAsync(command);
+    const { stdout } = await execFileAsync(resolveProgramPath(program), args);
     const processes = isWindows ? parseWindowsTasklistCsv(stdout) : parsePsAux(stdout);
 
     return {
@@ -81,10 +85,15 @@ export async function killProcess(args: unknown): Promise<ServerResult> {
     };
   }
 
+  const pid = parsed.data.pid;
+  // A start_process session ends with every process its command started, as with force_terminate
+  const outcome = await terminalManager.forceTerminate(pid);
+  if (outcome === 'failed') return terminationFailedResult(pid);
   try {
-    process.kill(parsed.data.pid);
+    // Returns once the process is gone, so a success means it no longer runs
+    if (outcome === 'not_found') await terminatePid(pid);
     return {
-      content: [{ type: "text", text: `Successfully terminated process ${parsed.data.pid}` }],
+      content: [{ type: "text", text: `Successfully terminated process ${pid}` }],
     };
   } catch (error) {
     return {

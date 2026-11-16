@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, w
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runIfMain } from './helpers/run-if-main.js';
 
 const TEST_FILE = fileURLToPath(import.meta.url);
 
@@ -26,7 +27,11 @@ async function parent() {
   const child = fork(TEST_FILE, [], { env: { ...process.env, HOME: home, USERPROFILE: home, DC_STALE_LOCK_WORKER: '1' }, stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
   try {
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('stale lock blocked config write')), 5_000);
+      // The child's start and write take well under a second here; this wait
+      // ends when it is done, so 30 s holds up on a loaded machine. A stale
+      // lock that isn't reclaimed fails sooner: the lock's retries give up
+      // after about 9 s and the child exits with an error
+      const timer = setTimeout(() => reject(new Error('stale lock blocked config write')), 30_000);
       child.on('message', (m) => { if (m.type === 'done') { clearTimeout(timer); resolve(); } });
       child.on('exit', (code) => { if (code) reject(new Error(`child exited ${code}`)); });
     });
@@ -34,9 +39,15 @@ async function parent() {
     assert.equal(existsSync(lockPath), false, 'stale lock should be removed after recovery');
     console.log('✓ dead-process config lock is reclaimed automatically');
   } finally {
+    // Removed once the child is gone: until then it watches the config folder,
+    // and a slow exit on a loaded machine would make the removal fail
+    const exited = child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve()
+      : new Promise((resolve) => child.once('exit', resolve));
     child.kill('SIGTERM');
+    await exited;
     rmSync(home, { recursive: true, force: true });
   }
 }
 
-if (process.env.DC_STALE_LOCK_WORKER === '1') await worker(); else await parent();
+if (process.env.DC_STALE_LOCK_WORKER === '1') await worker(); else await runIfMain(import.meta.url, parent);
